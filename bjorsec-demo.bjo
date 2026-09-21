@@ -1,0 +1,292 @@
+;; Playground/bjorsec-demo.bjo
+;;
+;; A calculator built out of bjorsec, and a check of every combinator it
+;; exports. The import is a module boundary, so the checks also say that the
+;; export list is complete.
+
+(import "bjorsec.bjo")
+(import (std simpletest))
+
+;; ---------------------------------------------------------------------------
+;; Running a parser in a test
+;; ---------------------------------------------------------------------------
+
+(: value (-> (Parser %a) string %a %a))
+(defun (value p input fallback)
+  (match (run-parser p input)
+    ((Ok v) v)
+    ((Err e) fallback)))
+
+(: ok? (-> (Parser %a) string bool))
+(defun (ok? p input)
+  (match (run-parser p input)
+    ((Ok v) #t)
+    ((Err e) #f)))
+
+(: message (-> (Parser %a) string string))
+(defun (message p input)
+  (match (run-parser/message p input)
+    ((Ok v) "")
+    ((Err e) e)))
+
+;; ---------------------------------------------------------------------------
+;; Primitives
+;; ---------------------------------------------------------------------------
+
+(: test-primitives (-> void))
+(defun (test-primitives)
+  (expect "preturn" (value (preturn 42) "" 0) 42)
+  (expect "pbind" (value (pbind (pchar #\a) (fun (c) (preturn (char->string c)))) "a" "") "a")
+  (expect "pmap" (value (pmap char->int (pchar #\a)) "a" 0) 97)
+  (expect "pright" (value (pright (pchar #\a) (pchar #\b)) "ab" #\z) #\b)
+  (expect "pleft" (value (pleft (pchar #\a) (pchar #\b)) "ab" #\z) #\a)
+  (expect "pboth" (value (pmap (fun (t) (match t ((Tuple a b) (list->string (list a b)))))
+                               (pboth (pchar #\a) (pchar #\b)))
+                         "ab" "")
+          "ab")
+  (expect "ppipe2" (value (ppipe2 pint (pright (pchar #\,) pint) (fun (a b) (+ a b))) "2,3" 0) 5)
+  (expect "ppipe3" (value (ppipe3 pint
+                                  (pright (pchar #\,) pint)
+                                  (pright (pchar #\,) pint)
+                                  (fun (a b c) (+ a b c)))
+                          "1,2,3" 0)
+          6)
+  (expect "psequence" (value (pmap list->string (psequence (list (pchar #\a) (pchar #\b)))) "ab" "") "ab")
+  (expect "between" (value (between (pchar #\() (pchar #\)) pint) "(42)" 0) 42)
+  (expect "choice" (value (choice (list (pchar #\a) (pchar #\b))) "b" #\z) #\b)
+  (expect-true "choice of nothing that fits" (not (ok? (choice (list (pchar #\a) (pchar #\b))) "c")))
+  (expect-true "pfail says what it was told" (string-contains? (message (pfail "nope") "x") "nope"))
+  (expect-true "pzero says nothing" (not (ok? pzero "x"))))
+
+;; ---------------------------------------------------------------------------
+;; Choice, backtracking and errors
+;; ---------------------------------------------------------------------------
+
+(: test-backtracking (-> void))
+(defun (test-backtracking)
+  (expect-true "por keeps the error of the branch that got somewhere"
+               (not (ok? (por (pright (pchar #\a) (pchar #\b)) (pchar #\a)) "ac")))
+  (expect-true "attempt gives the alternative its turn"
+               (ok? (por (attempt (pright (pchar #\a) (pchar #\b))) (pchar #\a)) "ac"))
+  (expect-true "a literal is atomic, so no attempt is needed"
+               (ok? (por (pstring "hello") (pstring "help")) "help"))
+  (expect-true "expectations at one position merge"
+               (string-contains? (message (por (pstring "hello") (pstring "world")) "xyz")
+                                 "'hello' or 'world'"))
+  (expect "look-ahead consumes nothing"
+          (value (pmap list->string
+                       (ppipe2 (look-ahead (pchar #\a)) (many any-char) (fun (c cs) (Cons c cs))))
+                 "ab" "")
+          "aab")
+  (expect-true "followed-by" (ok? (pleft (pchar #\a) (followed-by (pchar #\b) "'b'")) "ab"))
+  (expect-true "followed-by refuses" (not (ok? (pleft (pchar #\a) (followed-by (pchar #\b) "'b'")) "ac")))
+  (expect-true "not-followed-by" (ok? (pleft (pchar #\a) (not-followed-by (pchar #\b) "'b'")) "ac"))
+  (expect-true "plabel renames what was expected"
+               (string-contains? (message (plabel (pchar #\a) "a greeting") "z") "a greeting"))
+  (expect "pposition"
+          (value (pmap (fun (p) (struct-ref p column)) (pright (pstring "ab") pposition)) "abc" 0)
+          3))
+
+(: test-errors (-> void))
+(defun (test-errors)
+  (def text "ab\ncd")
+  (def broken (pright (pstring "ab\nc") (pchar #\z)))
+  (expect-true "an error names its line" (string-contains? (message broken text) "line 2"))
+  (expect-true "an error names its column" (string-contains? (message broken text) "column 2"))
+  (expect-true "an error draws the line it is on" (string-contains? (message broken text) "\ncd\n"))
+  (expect-true "an error points at the character" (string-contains? (message broken text) "^"))
+  (expect-true "an error says what was there instead"
+               (string-contains? (message broken text) "Unexpected: 'd'"))
+  (expect-true "three expectations read as a list"
+               (string-contains? (message (choice (list (pstring "aa") (pstring "bb") (pstring "cc"))) "zz")
+                                 "'aa', 'bb' or 'cc'"))
+  (expect-true "an expectation is not said twice"
+               (string-contains? (message (choice (list (pchar #\a) (pchar #\a) (pchar #\b))) "z")
+                                 "'a' or 'b'"))
+  (match (run-parser (pchar #\a) "b")
+    ((Ok v) (fail "a 'b' is not an 'a'"))
+    ((Err e) (expect-true "a ParseError prints itself" (string-contains? #"${e}" "Expecting"))))
+  (expect "a fresh state starts at column one"
+          (struct-ref (state-position (make-state "hi")) column)
+          1)
+  (expect "a newline moves the line on"
+          (value (pmap (fun (p) (struct-ref p line)) (pright (pstring "ab\nc") pposition)) "ab\ncd" 0)
+          2))
+
+;; ---------------------------------------------------------------------------
+;; Characters and strings
+;; ---------------------------------------------------------------------------
+
+(: test-chars (-> void))
+(defun (test-chars)
+  (expect "satisfy" (value (satisfy char-upper-case? "an upper-case letter") "Abc" #\z) #\A)
+  (expect "any-char" (value any-char "abc" #\z) #\a)
+  (expect "pchar" (value (pchar #\a) "abc" #\z) #\a)
+  (expect "pchar/ci" (value (pchar/ci #\a) "Abc" #\z) #\A)
+  (expect "any-of" (value (any-of "xyz") "y" #\a) #\y)
+  (expect "none-of" (value (none-of "xyz") "a" #\z) #\a)
+  (expect "pstring" (value (pstring "ab") "abc" "") "ab")
+  (expect "pstring/ci" (value (pstring/ci "ab") "ABc" "") "AB")
+  (expect "many-satisfy" (value (many-satisfy char-alphabetic?) "abc1" "") "abc")
+  (expect "many-satisfy of nothing" (value (many-satisfy char-alphabetic?) "1" "x") "")
+  (expect "many-satisfy1" (value (many-satisfy1 char-alphabetic? "a word") "abc1" "") "abc")
+  (expect-true "many-satisfy1 needs one" (not (ok? (many-satisfy1 char-alphabetic? "a word") "1")))
+  (expect "many-chars" (value (many-chars letter) "abc1" "") "abc")
+  (expect "many-chars1" (value (many-chars1 alphanumeric) "a1!" "") "a1")
+  (expect "spaces" (value (pright spaces (pchar #\a)) "   a" #\z) #\a)
+  (expect "spaces1" (value (pright spaces1 (pchar #\a)) " a" #\z) #\a)
+  (expect-true "spaces1 needs one" (not (ok? (pright spaces1 (pchar #\a)) "a")))
+  (expect "pnewline takes a return with it" (value (pright (pstring "a") pnewline) "a\r\nb" #\z) #\newline)
+  (expect "digit" (value digit "7" #\z) #\7)
+  (expect-true "eof" (ok? (pleft (pstring "a") eof) "a"))
+  (expect-true "eof refuses the rest" (not (ok? (pleft (pstring "a") eof) "ab"))))
+
+;; ---------------------------------------------------------------------------
+;; Repetition
+;; ---------------------------------------------------------------------------
+
+(: minus-op (Parser (-> int int int)))
+(def minus-op (pright (pchar #\-) (preturn (fun (a b) (- a b)))))
+
+(: test-repetition (-> void))
+(defun (test-repetition)
+  (expect "many" (value (pmap list->string (many (pchar #\a))) "aaab" "") "aaa")
+  (expect "many of nothing" (value (pmap list->string (many (pchar #\a))) "b" "x") "")
+  (expect-true "many propagates a failure that consumed"
+               (not (ok? (many (pright (pchar #\a) (pchar #\b))) "abac")))
+  (expect "many1" (value (pmap list->string (many1 (pchar #\a))) "aa" "") "aa")
+  (expect-true "many1 needs one" (not (ok? (many1 (pchar #\a)) "b")))
+  (expect "skip-many" (value (pright (skip-many (pchar #\a)) (pchar #\b)) "aaab" #\z) #\b)
+  (expect "skip-many1" (value (pright (skip-many1 (pchar #\a)) (pchar #\b)) "ab" #\z) #\b)
+  (expect-true "skip-many1 needs one" (not (ok? (skip-many1 (pchar #\a)) "b")))
+  (expect "many-fold" (value (many-fold (fun (c acc) (+ acc 1)) 0 (pchar #\a)) "aaa" -1) 3)
+  (expect "many-till" (value (pmap list->string (many-till any-char (pchar #\!))) "abc!" "") "abc")
+  (expect "prepeat" (value (pmap list->string (prepeat 2 any-char)) "abc" "") "ab")
+  (expect-true "prepeat wants them all" (not (ok? (prepeat 4 any-char) "abc")))
+  (expect "sep-by" (value (pmap list->string (sep-by letter (pchar #\,))) "a,b,c" "") "abc")
+  (expect "sep-by of nothing" (value (pmap list->string (sep-by letter (pchar #\,))) "!" "x") "")
+  (expect-true "a trailing separator is a failure" (not (ok? (pleft (sep-by letter (pchar #\,)) eof) "a,b,")))
+  (expect-true "sep-by1 needs one" (not (ok? (sep-by1 letter (pchar #\,)) "!")))
+  (expect "sep-end-by" (value (pmap list->string (pleft (sep-end-by letter (pchar #\,)) eof)) "a,b," "") "ab")
+  (expect "sep-end-by1" (value (pmap list->string (pleft (sep-end-by1 letter (pchar #\,)) eof)) "a," "") "a")
+  (expect "opt" (value (pmap (fun (o) (option-ref-or o #\z)) (opt (pchar #\a))) "b" #\x) #\z)
+  (expect "opt-or" (value (opt-or (pchar #\a) #\z) "b" #\x) #\z)
+  (expect-true "optional" (ok? (pleft (optional (pchar #\a)) eof) ""))
+  (expect "chainl1 groups to the left" (value (chainl1 pint minus-op) "8-4-2" 0) 2)
+  (expect "chainr1 groups to the right" (value (chainr1 pint minus-op) "8-4-2" 0) 6))
+
+;; ---------------------------------------------------------------------------
+;; Numbers and knots
+;; ---------------------------------------------------------------------------
+
+(: test-numbers (-> void))
+(defun (test-numbers)
+  (expect "pint" (value pint "42x" 0) 42)
+  (expect "pint takes a sign" (value pint "-42" 0) -42)
+  (expect-true "pint gives a lone sign back" (not (ok? pint "-x")))
+  (expect "pdouble" (value pdouble "3.5e2" 0.0) 350.0)
+  (expect "pdouble leaves a dot that is not a fraction"
+          (value (pleft pdouble (pstring "..")) "1..2" 0.0)
+          1.0)
+  (expect "plazy" (value (plazy (fun () (pchar #\a))) "a" #\z) #\a))
+
+;; ---------------------------------------------------------------------------
+;; A calculator
+;; ---------------------------------------------------------------------------
+;; expr = term (('+' | '-') term)*, term = factor (('*' | '/') factor)*,
+;; factor = number | '(' expr ')'. The grammar is made of values rather than of
+;; functions, so the recursion goes through a ParserRef that build-calculator!
+;; fills in.
+
+(: token (-> (Parser %a) (Parser %a)))
+(defun (token p) (pleft p spaces))
+
+(: sym (-> char (Parser char)))
+(defun (sym c) (token (pchar c)))
+
+(: number (Parser double))
+(def number (token (plabel pdouble "a number")))
+
+(: expr-ref (ParserRef double))
+(def expr-ref (pforward))
+
+(: expr (Parser double))
+(def expr (pforwarded expr-ref))
+
+(: factor (Parser double))
+(def factor (por number (between (sym #\() (sym #\)) expr)))
+
+(: mul-op (Parser (-> double double double)))
+(def mul-op
+  (por (pright (sym #\*) (preturn (fun (a b) (* a b))))
+       (pright (sym #\/) (preturn (fun (a b) (/ a b))))))
+
+(: add-op (Parser (-> double double double)))
+(def add-op
+  (por (pright (sym #\+) (preturn (fun (a b) (+ a b))))
+       (pright (sym #\-) (preturn (fun (a b) (- a b))))))
+
+(: term (Parser double))
+(def term (chainl1 factor mul-op))
+
+(: sum (Parser double))
+(def sum (chainl1 term add-op))
+
+(: calculator (Parser double))
+(def calculator (pright spaces (pleft sum eof)))
+
+(: build-calculator! (-> void))
+(defun (build-calculator!)
+  (pforward-set! expr-ref sum))
+
+(: test-calculator (-> void))
+(defun (test-calculator)
+  (expect "precedence" (value calculator "1 + 2 * 3" 0.0) 7.0)
+  (expect "parentheses" (value calculator "(1 + 2) * 3" 0.0) 9.0)
+  (expect "left association" (value calculator "6 / 3 / 2" 0.0) 1.0)
+  (expect "negative literals" (value calculator "-2 * 3" 0.0) -6.0)
+  (expect-true "an unclosed parenthesis is refused" (not (ok? calculator "2 * (3 + 4"))))
+
+;; ---------------------------------------------------------------------------
+;; A list of words, and what a failure looks like
+;; ---------------------------------------------------------------------------
+
+(: hello-world (Parser (List string)))
+(def hello-world
+  (pleft (sep-by (por (pstring "hello") (pstring "world"))
+                 (pchar #\,))
+         eof))
+
+(: show-words (-> string void))
+(defun (show-words input)
+  (println (str "> " input))
+  (match (run-parser hello-world input)
+    ((Ok words) (println (str "  " (string-join (list->vec words) " "))))
+    ((Err e) (println (error->string e))))
+  (newline))
+
+(: show-calc (-> string void))
+(defun (show-calc input)
+  (println (str "> " input))
+  (match (run-parser calculator input)
+    ((Ok v) (println (str "  = " (double->string v))))
+    ((Err e) (println e)))
+  (newline))
+
+(defun (main args)
+  (build-calculator!)
+
+  (test-primitives)
+  (test-backtracking)
+  (test-errors)
+  (test-chars)
+  (test-repetition)
+  (test-numbers)
+  (test-calculator)
+
+  (newline)
+  (show-words "hello,world,hello")
+  (show-words "hello,world,invalid")
+  (show-calc "1 + 2 * (3 - 0.5)")
+  (show-calc "2 * (3 + 4")
+  0)

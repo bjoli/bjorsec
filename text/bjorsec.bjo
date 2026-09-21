@@ -1,0 +1,838 @@
+;; Playground/bjorsec.bjo
+;;
+;; Parser combinators, after FParsec.
+;;
+;; A parser is a function from a mutable State to a Reply, and it advances the
+;; state in place. A parser that fails may therefore have consumed input, and
+;; whether it did is what the rest of the design is built on:
+;;
+;;   - (por p q) runs q only when p failed without consuming anything, so an
+;;     error deep inside p is reported where it happened rather than being
+;;     replaced by whatever q has to say.
+;;   - (attempt p) restores the position on failure, which is how a grammar
+;;     asks for the backtracking por does not do by itself.
+;;   - pstring, pint and pdouble restore the position themselves when they
+;;     fail, so (por (pstring "hello") (pstring "world")) needs no attempt.
+;;
+;; An error carries a position and a list of expectations. Two errors at the
+;; same position merge, which is what turns the choice above into
+;; "Expecting: 'hello' or 'world'".
+
+(export
+  ;; types
+  State Mark Position ErrorItem ParseError Reply Parser ParserRef
+  ;; running a parser
+  make-state state-position run-parser run-parser/message error->string
+  ;; primitives
+  preturn pzero pfail pbind pmap pright pleft pboth ppipe2 ppipe3 psequence
+  ;; choice, backtracking, errors
+  por choice attempt look-ahead followed-by not-followed-by plabel pposition
+  ;; characters and strings
+  satisfy any-char pchar pchar/ci any-of none-of pstring pstring/ci
+  many-satisfy many-satisfy1 many-chars many-chars1
+  spaces spaces1 pnewline letter digit alphanumeric eof
+  ;; repetition
+  many many1 skip-many skip-many1 many-fold many-till prepeat
+  sep-by sep-by1 sep-end-by sep-end-by1 between opt opt-or optional
+  chainl1 chainr1
+  ;; numbers
+  pint pdouble
+  ;; recursive grammars
+  pforward pforwarded pforward-set! plazy)
+
+;; ---------------------------------------------------------------------------
+;; The state
+;; ---------------------------------------------------------------------------
+;; The cursor is where the parser is. The line and the start of it are carried
+;; along so that a position costs one substring of the current line rather than
+;; a walk of everything before it.
+
+(type
+  (: State (Record
+             (: text string)
+             (: pos StringCursor #:mutable)
+             (: line int #:mutable)
+             (: line-start StringCursor #:mutable))))
+
+;; What a backtracking combinator saves. A struct, so saving one is a read of
+;; three fields and no allocation. The fields are named apart from State's so
+;; that a (record-ref st pos) resolves without the state having been pinned to
+;; a type first.
+(type
+  (: Mark (Struct
+            (: cursor StringCursor)
+            (: row int)
+            (: row-start StringCursor))))
+
+(type
+  (: Position (Struct
+                (: line int)
+                (: column int))))
+
+(: make-state (-> string State))
+(defun (make-state text)
+  (State (text text)
+         (pos (string-cursor-start text))
+         (line 1)
+         (line-start (string-cursor-start text))))
+
+(: mark (-> State Mark))
+(defun (mark st)
+  (Mark (cursor (record-ref st pos))
+        (row (record-ref st line))
+        (row-start (record-ref st line-start))))
+
+(: reset! (-> State Mark void))
+(defun (reset! st m)
+  (record-set! st
+               (pos (struct-ref m cursor))
+               (line (struct-ref m row))
+               (line-start (struct-ref m row-start))))
+
+;; Whether anything has been consumed since the mark was taken.
+(: moved? (-> State Mark bool))
+(defun (moved? st m)
+  (not (string-cursor=? (record-ref st pos) (struct-ref m cursor))))
+
+(: at-end? (-> State bool))
+(defun (at-end? st)
+  (string-cursor-end? (record-ref st text) (record-ref st pos)))
+
+;; Steps over the character at the cursor. A line ends at the newline whether
+;; or not a return came before it, so a lone #\return counts as no line.
+(: advance! (-> State char StringCursor void))
+(defun (advance! st c next)
+  (cond
+    ((char=? c #\newline)
+     (record-set! st (pos next) (line (+ 1 (record-ref st line))) (line-start next)))
+    (else
+     (record-set! st (pos next)))))
+
+;; Consumes characters while they satisfy pred, and answers how many.
+(: skip-while! (-> State (-> char bool) int))
+(defun (skip-while! st pred)
+  (def text (record-ref st text))
+  (let go ((n 0))
+    (cond
+      ((at-end? st) n)
+      (else
+       (def (Tuple c next) (string-cursor-ref+next text (record-ref st pos)))
+       (cond
+         ((pred c) (advance! st c next) (go (+ n 1)))
+         (else n))))))
+
+;; Consumes one particular character, and answers whether it was there.
+(: skip-char! (-> State char bool))
+(defun (skip-char! st c)
+  (cond
+    ((at-end? st) #f)
+    (else
+     (def (Tuple got next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
+     (cond
+       ((char=? got c) (advance! st got next) #t)
+       (else #f)))))
+
+(: state-position (-> State Position))
+(defun (state-position st)
+  (Position (line (record-ref st line))
+            (column (+ 1 (string-count (substring/cursors (record-ref st text)
+                                                          (record-ref st line-start)
+                                                          (record-ref st pos)))))))
+
+;; ---------------------------------------------------------------------------
+;; Errors
+;; ---------------------------------------------------------------------------
+
+(type
+  (: ErrorItem (Union
+                 (Expected string)
+                 (Unexpected string)
+                 (ErrorMessage string))))
+
+;; The source is carried so that an error can print the line it happened on
+;; without the caller having to hand the text back.
+(type
+  (: ParseError (Record
+                  (: source string)
+                  (: position Position)
+                  (: items (List ErrorItem)))))
+
+(: error-at (-> State (List ErrorItem) ParseError))
+(defun (error-at st xs)
+  (ParseError (source (record-ref st text))
+              (position (state-position st))
+              (items xs)))
+
+(: expected-error (-> State string ParseError))
+(defun (expected-error st what)
+  (error-at st (Cons (Expected what) Nil)))
+
+(: message-error (-> State string ParseError))
+(defun (message-error st msg)
+  (error-at st (Cons (ErrorMessage msg) Nil)))
+
+;; The character at the cursor, as a message names it.
+(: found (-> State string))
+(defun (found st)
+  (cond
+    ((at-end? st) "end of input")
+    (else (char-name (string-cursor-ref (record-ref st text) (record-ref st pos))))))
+
+(: expected-found-error (-> State string ParseError))
+(defun (expected-found-error st what)
+  (error-at st (Cons (Expected what) (Cons (Unexpected (found st)) Nil))))
+
+(: char-name (-> char string))
+(defun (char-name c)
+  (cond
+    ((char=? c #\newline) "a newline")
+    ((char=? c #\tab) "a tab")
+    ((char=? c #\return) "a carriage return")
+    (else (quoted (char->string c)))))
+
+(: quoted (-> string string))
+(defun (quoted s)
+  (str "'" s "'"))
+
+(: position<? (-> Position Position bool))
+(defun (position<? a b)
+  (cond
+    ((= (struct-ref a line) (struct-ref b line))
+     (< (struct-ref a column) (struct-ref b column)))
+    (else (< (struct-ref a line) (struct-ref b line)))))
+
+;; The error that got further wins; two at the same place become one listing
+;; both expectations.
+(: error-merge (-> ParseError ParseError ParseError))
+(defun (error-merge a b)
+  (def pa (record-ref a position))
+  (def pb (record-ref b position))
+  (cond
+    ((position<? pa pb) b)
+    ((position<? pb pa) a)
+    (else (ParseError (source (record-ref a source))
+                      (position pa)
+                      (items (list-append (record-ref a items) (record-ref b items)))))))
+
+;; ---------------------------------------------------------------------------
+;; Reporting
+;; ---------------------------------------------------------------------------
+
+;; The items of one kind, in the order they were reported. `:when-let` is the
+;; whole of the selection: an item of another kind matches no pattern and the
+;; iteration is skipped.
+(: expected-strings (-> (List ErrorItem) (List string)))
+(defun (expected-strings xs)
+  (unique {listing s (:for it xs) (:when-let (Expected s) it)}))
+
+(: unexpected-strings (-> (List ErrorItem) (List string)))
+(defun (unexpected-strings xs)
+  (unique {listing s (:for it xs) (:when-let (Unexpected s) it)}))
+
+(: message-strings (-> (List ErrorItem) (List string)))
+(defun (message-strings xs)
+  (unique {listing s (:for it xs) (:when-let (ErrorMessage s) it)}))
+
+(: member? (-> string (List string) bool))
+(defun (member? x xs)
+  (match xs
+    (Nil #f)
+    ((Cons y rest) (cond ((= x y) #t) (else (member? x rest))))))
+
+;; `seen` carries the elements already passed, so the test is against what the
+;; iterations before this one saw rather than against what the accumulator has
+;; become — a collector is a builder and cannot be read back mid-loop.
+(: unique (-> (List string) (List string)))
+(defun (unique xs)
+  (loop (:for x xs)
+        (:with seen Nil (Cons x seen))
+        (:when (not (member? x seen)))
+        (:acc out (listing x))
+        => out))
+
+;; "a", "a or b", "a, b or c".
+;;
+;; `over-list` walks the tails, so what follows an element is in hand when the
+;; separator after it is chosen and the last two need no special case.
+(: or-join (-> (List string) string))
+(defun (or-join xs)
+  (def sb (stringbuilder-empty))
+  (loop (:for tail (over-list xs))
+        (:let rest (list-tail tail))
+        (:do (stringbuilder-add-string! sb (list-head tail))
+             (cond
+               ((list-empty? rest) unit)
+               ((list-empty? (list-tail rest)) (stringbuilder-add-string! sb " or "))
+               (else (stringbuilder-add-string! sb ", ")))))
+  (stringbuilder->string sb))
+
+(: source-line (-> string int (Option string)))
+(defun (source-line text n)
+  (def lines (string-split text "\n"))
+  (cond
+    ((or (< n 1) (> n (vec-length lines))) None)
+    (else (Some (string-trim-end (vec-ref lines (- n 1)))))))
+
+(: error->string (-> ParseError string))
+(defun (error->string e)
+  (def p (record-ref e position))
+  (def column (struct-ref p column))
+  (def sb (stringbuilder-empty))
+  (stringbuilder-add-string!
+    sb (str "Parse error at line " (int->string (struct-ref p line))
+            ", column " (int->string column) ":"))
+  (match (source-line (record-ref e source) (struct-ref p line))
+    ((Some text)
+     (stringbuilder-add-string! sb (str "\n" text "\n" (string-pad-left "^" column))))
+    (None unit))
+  (def expected (expected-strings (record-ref e items)))
+  (def unexpected (unexpected-strings (record-ref e items)))
+  (unless (list-empty? expected)
+    (stringbuilder-add-string! sb (str "\nExpecting: " (or-join expected))))
+  (unless (list-empty? unexpected)
+    (stringbuilder-add-string! sb (str "\nUnexpected: " (or-join unexpected))))
+  (list-for-each (fun (m) (stringbuilder-add-string! sb (str "\n" m)))
+                 (message-strings (record-ref e items)))
+  (stringbuilder->string sb))
+
+(impl (->str ParseError)
+  (defun (->str e) (error->string e)))
+
+;; ---------------------------------------------------------------------------
+;; Parsers
+;; ---------------------------------------------------------------------------
+
+(type
+  (: (Reply %a) (Union
+                  (ReplyOk %a)
+                  (ReplyErr ParseError))))
+
+(type (: (Parser %a) (-> State (Reply %a))))
+
+(: run-parser (-> (Parser %a) string (Result ParseError %a)))
+(defun (run-parser p text)
+  (match (p (make-state text))
+    ((ReplyOk v) (Ok v))
+    ((ReplyErr e) (Err e))))
+
+(: run-parser/message (-> (Parser %a) string (Result string %a)))
+(defun (run-parser/message p text)
+  (match (run-parser p text)
+    ((Ok v) (Ok v))
+    ((Err e) (Err (error->string e)))))
+
+;; ---------------------------------------------------------------------------
+;; Primitives
+;; ---------------------------------------------------------------------------
+
+(: preturn (-> %a (Parser %a)))
+(defun (preturn v)
+  (fun (st) (ReplyOk v)))
+
+;; Fails with nothing to say, which is what choice folds over and what an
+;; expectation from elsewhere merges cleanly with.
+(: pzero (Parser %a))
+(defun (pzero st)
+  (ReplyErr (error-at st Nil)))
+
+(: pfail (-> string (Parser %a)))
+(defun (pfail msg)
+  (fun (st) (ReplyErr (message-error st msg))))
+
+(: pbind (-> (Parser %a) (-> %a (Parser %b)) (Parser %b)))
+(defun (pbind p f)
+  (fun (st)
+    (match (p st)
+      ((ReplyOk v) ((f v) st))
+      ((ReplyErr e) (ReplyErr e)))))
+
+(: pmap (-> (-> %a %b) (Parser %a) (Parser %b)))
+(defun (pmap f p)
+  (fun (st)
+    (match (p st)
+      ((ReplyOk v) (ReplyOk (f v)))
+      ((ReplyErr e) (ReplyErr e)))))
+
+(: ppipe2 (-> (Parser %a) (Parser %b) (-> %a %b %c) (Parser %c)))
+(defun (ppipe2 p q f)
+  (fun (st)
+    (match (p st)
+      ((ReplyErr e) (ReplyErr e))
+      ((ReplyOk a)
+       (match (q st)
+         ((ReplyErr e) (ReplyErr e))
+         ((ReplyOk b) (ReplyOk (f a b))))))))
+
+(: ppipe3 (-> (Parser %a) (Parser %b) (Parser %c) (-> %a %b %c %d) (Parser %d)))
+(defun (ppipe3 p q r f)
+  (ppipe2 (pboth p q) r (fun (ab c) (match ab ((Tuple a b) (f a b c))))))
+
+(: pright (-> (Parser %a) (Parser %b) (Parser %b)))
+(defun (pright p q) (ppipe2 p q (fun (_ b) b)))
+
+(: pleft (-> (Parser %a) (Parser %b) (Parser %a)))
+(defun (pleft p q) (ppipe2 p q (fun (a _) a)))
+
+(: pboth (-> (Parser %a) (Parser %b) (Parser (Tuple %a %b))))
+(defun (pboth p q) (ppipe2 p q (fun (a b) (Tuple a b))))
+
+(: between (-> (Parser %open) (Parser %close) (Parser %a) (Parser %a)))
+(defun (between popen pclose p)
+  (pright popen (pleft p pclose)))
+
+;; Every parser in turn, collecting what they answer.
+;;
+;; Written out rather than as a loop over ps: the first failure has to leave
+;; with its error, and `ret` may only stand as a statement or in tail position
+;; — not as the expression a collector accumulates.
+(: psequence (-> (List (Parser %a)) (Parser (List %a))))
+(defun (psequence ps)
+  (fun (st)
+    (let go ((rest ps) (acc Nil))
+      (match rest
+        (Nil (ReplyOk (list-reverse acc)))
+        ((Cons p more)
+         (match (p st)
+           ((ReplyOk v) (go more (Cons v acc)))
+           ((ReplyErr e) (ReplyErr e))))))))
+
+;; ---------------------------------------------------------------------------
+;; Choice and backtracking
+;; ---------------------------------------------------------------------------
+
+(: por (-> (Parser %a) (Parser %a) (Parser %a)))
+(defun (por p q)
+  (fun (st)
+    (def m (mark st))
+    (match (p st)
+      ((ReplyOk v) (ReplyOk v))
+      ((ReplyErr e1)
+       (cond
+         ((moved? st m) (ReplyErr e1))
+         (else
+          (match (q st)
+            ((ReplyOk v) (ReplyOk v))
+            ((ReplyErr e2) (ReplyErr (error-merge e1 e2))))))))))
+
+(: choice (-> (List (Parser %a)) (Parser %a)))
+(defun (choice ps)
+  (list-foldr por pzero ps))
+
+;; Turns a failure that consumed input into one that did not, which is what
+;; lets por try the next alternative after it.
+(: attempt (-> (Parser %a) (Parser %a)))
+(defun (attempt p)
+  (fun (st)
+    (def m (mark st))
+    (match (p st)
+      ((ReplyOk v) (ReplyOk v))
+      ((ReplyErr e) (reset! st m) (ReplyErr e)))))
+
+(: look-ahead (-> (Parser %a) (Parser %a)))
+(defun (look-ahead p)
+  (fun (st)
+    (def m (mark st))
+    (def reply (p st))
+    (reset! st m)
+    reply))
+
+(: followed-by (-> (Parser %a) string (Parser void)))
+(defun (followed-by p what)
+  (fun (st)
+    (def m (mark st))
+    (def reply (p st))
+    (reset! st m)
+    (match reply
+      ((ReplyOk v) (ReplyOk unit))
+      ((ReplyErr e) (ReplyErr (expected-error st what))))))
+
+(: not-followed-by (-> (Parser %a) string (Parser void)))
+(defun (not-followed-by p what)
+  (fun (st)
+    (def m (mark st))
+    (def reply (p st))
+    (reset! st m)
+    (match reply
+      ((ReplyOk v) (ReplyErr (error-at st (Cons (Unexpected what) Nil))))
+      ((ReplyErr e) (ReplyOk unit)))))
+
+;; Replaces what p expected, as long as p did not get anywhere: a failure
+;; inside p that consumed input knows more than the label does.
+(: plabel (-> (Parser %a) string (Parser %a)))
+(defun (plabel p what)
+  (fun (st)
+    (def m (mark st))
+    (match (p st)
+      ((ReplyOk v) (ReplyOk v))
+      ((ReplyErr e)
+       (cond
+         ((moved? st m) (ReplyErr e))
+         (else (ReplyErr (expected-error st what))))))))
+
+(: pposition (Parser Position))
+(defun (pposition st)
+  (ReplyOk (state-position st)))
+
+;; ---------------------------------------------------------------------------
+;; Characters and strings
+;; ---------------------------------------------------------------------------
+
+(: satisfy (-> (-> char bool) string (Parser char)))
+(defun (satisfy pred what)
+  (fun (st)
+    (cond
+      ((at-end? st) (ReplyErr (expected-found-error st what)))
+      (else
+       (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
+       (cond
+         ((pred c) (advance! st c next) (ReplyOk c))
+         (else (ReplyErr (expected-found-error st what))))))))
+
+(: any-char (Parser char))
+(defun (any-char st)
+  (cond
+    ((at-end? st) (ReplyErr (expected-found-error st "any character")))
+    (else
+     (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
+     (advance! st c next)
+     (ReplyOk c))))
+
+(: pchar (-> char (Parser char)))
+(defun (pchar c)
+  (satisfy (fun (x) (char=? x c)) (char-name c)))
+
+(: pchar/ci (-> char (Parser char)))
+(defun (pchar/ci c)
+  (satisfy (fun (x) (char-ci=? x c)) (char-name c)))
+
+(: char-in? (-> char string bool))
+(defun (char-in? c s)
+  (match (string-index #(char=? & c) s)
+    ((Some found) #t)
+    (None #f)))
+
+(: any-of (-> string (Parser char)))
+(defun (any-of s)
+  (satisfy (fun (c) (char-in? c s)) (str "one of " (quoted s))))
+
+(: none-of (-> string (Parser char)))
+(defun (none-of s)
+  (satisfy (fun (c) (not (char-in? c s))) (str "a character other than " (quoted s))))
+
+;; All or nothing: a half-matched literal leaves the cursor where it was, so a
+;; choice between literals needs no attempt.
+(: pstring (-> string (Parser string)))
+(defun (pstring s)
+  (fun (st)
+    (def m (mark st))
+    (def text (record-ref st text))
+    (let go ((sc (string-cursor-start s)))
+      (cond
+        ((string-cursor-end? s sc) (ReplyOk s))
+        ((at-end? st)
+         (reset! st m)
+         (ReplyErr (expected-found-error st (quoted s))))
+        (else
+         (def (Tuple want wnext) (string-cursor-ref+next s sc))
+         (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
+         (cond
+           ((char=? want got) (advance! st got gnext) (go wnext))
+           (else
+            (reset! st m)
+            (ReplyErr (expected-found-error st (quoted s))))))))))
+
+(: pstring/ci (-> string (Parser string)))
+(defun (pstring/ci s)
+  (fun (st)
+    (def m (mark st))
+    (def text (record-ref st text))
+    (def start (record-ref st pos))
+    (let go ((sc (string-cursor-start s)))
+      (cond
+        ((string-cursor-end? s sc)
+         (ReplyOk (substring/cursors text start (record-ref st pos))))
+        ((at-end? st)
+         (reset! st m)
+         (ReplyErr (expected-found-error st (quoted s))))
+        (else
+         (def (Tuple want wnext) (string-cursor-ref+next s sc))
+         (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
+         (cond
+           ((char-ci=? want got) (advance! st got gnext) (go wnext))
+           (else
+            (reset! st m)
+            (ReplyErr (expected-found-error st (quoted s))))))))))
+
+;; The run of characters satisfying pred, as a string. Never fails.
+(: many-satisfy (-> (-> char bool) (Parser string)))
+(defun (many-satisfy pred)
+  (fun (st)
+    (def start (record-ref st pos))
+    (ignore (skip-while! st pred))
+    (ReplyOk (substring/cursors (record-ref st text) start (record-ref st pos)))))
+
+(: many-satisfy1 (-> (-> char bool) string (Parser string)))
+(defun (many-satisfy1 pred what)
+  (fun (st)
+    (def start (record-ref st pos))
+    (cond
+      ((= 0 (skip-while! st pred)) (ReplyErr (expected-found-error st what)))
+      (else (ReplyOk (substring/cursors (record-ref st text) start (record-ref st pos)))))))
+
+(: many-chars (-> (Parser char) (Parser string)))
+(defun (many-chars p)
+  (pmap list->string (many p)))
+
+(: many-chars1 (-> (Parser char) (Parser string)))
+(defun (many-chars1 p)
+  (pmap list->string (many1 p)))
+
+(: spaces (Parser void))
+(defun (spaces st)
+  (ignore (skip-while! st char-whitespace?))
+  (ReplyOk unit))
+
+(: spaces1 (Parser void))
+(defun (spaces1 st)
+  (cond
+    ((> (skip-while! st char-whitespace?) 0) (ReplyOk unit))
+    (else (ReplyErr (expected-found-error st "whitespace")))))
+
+;; A line ending in any of its three spellings, answering #\newline.
+(: pnewline (Parser char))
+(defun (pnewline st)
+  (cond
+    ((skip-char! st #\return) (ignore (skip-char! st #\newline)) (ReplyOk #\newline))
+    ((skip-char! st #\newline) (ReplyOk #\newline))
+    (else (ReplyErr (expected-found-error st "a newline")))))
+
+(: ascii-digit? (-> char bool))
+(defun (ascii-digit? c)
+  (and (char>=? c #\0) (char<=? c #\9)))
+
+(: letter (Parser char))
+(def letter (satisfy char-alphabetic? "a letter"))
+
+(: digit (Parser char))
+(def digit (satisfy ascii-digit? "a digit"))
+
+(: alphanumeric (Parser char))
+(def alphanumeric
+  (satisfy (fun (c) (or (char-alphabetic? c) (ascii-digit? c))) "a letter or a digit"))
+
+(: eof (Parser void))
+(defun (eof st)
+  (cond
+    ((at-end? st) (ReplyOk unit))
+    (else (ReplyErr (expected-found-error st "end of input")))))
+
+;; ---------------------------------------------------------------------------
+;; Repetition
+;; ---------------------------------------------------------------------------
+;; p is run until it fails. A failure that consumed input is the whole loop's
+;; failure: it is a grammar error inside p rather than the end of the run.
+
+(: many-fold (-> (-> %a %s %s) %s (Parser %a) (Parser %s)))
+(defun (many-fold f init p)
+  (fun (st)
+    (let go ((acc init))
+      (def m (mark st))
+      (match (p st)
+        ((ReplyOk v)
+         (cond
+           ((moved? st m) (go (f v acc)))
+           (else (panic! "bjorsec: a parser under many succeeded without consuming input"))))
+        ((ReplyErr e)
+         (cond
+           ((moved? st m) (ReplyErr e))
+           (else (ReplyOk acc))))))))
+
+(: many (-> (Parser %a) (Parser (List %a))))
+(defun (many p)
+  (pmap list-reverse (many-fold (fun (x acc) (Cons x acc)) Nil p)))
+
+(: many1 (-> (Parser %a) (Parser (List %a))))
+(defun (many1 p)
+  (ppipe2 p (many p) (fun (x xs) (Cons x xs))))
+
+(: skip-many (-> (Parser %a) (Parser void)))
+(defun (skip-many p)
+  (many-fold (fun (x acc) acc) unit p))
+
+(: skip-many1 (-> (Parser %a) (Parser void)))
+(defun (skip-many1 p)
+  (pright p (skip-many p)))
+
+;; p until end matches. end is tried first, so it wins a tie.
+(: many-till (-> (Parser %a) (Parser %end) (Parser (List %a))))
+(defun (many-till p end)
+  (fun (st)
+    (let go ((acc Nil))
+      (def m (mark st))
+      (match (end st)
+        ((ReplyOk v) (ReplyOk (list-reverse acc)))
+        ((ReplyErr e1)
+         (cond
+           ((moved? st m) (ReplyErr e1))
+           (else
+            (match (p st)
+              ((ReplyOk v) (go (Cons v acc)))
+              ((ReplyErr e2) (ReplyErr (error-merge e1 e2)))))))))))
+
+(: prepeat (-> int (Parser %a) (Parser (List %a))))
+(defun (prepeat n p)
+  (fun (st)
+    (let go ((i 0) (acc Nil))
+      (cond
+        ((>= i n) (ReplyOk (list-reverse acc)))
+        (else
+         (match (p st)
+           ((ReplyOk v) (go (+ i 1) (Cons v acc)))
+           ((ReplyErr e) (ReplyErr e))))))))
+
+(: sep-by1 (-> (Parser %a) (Parser %sep) (Parser (List %a))))
+(defun (sep-by1 p sep)
+  (ppipe2 p (many (pright sep p)) (fun (x xs) (Cons x xs))))
+
+(: sep-by (-> (Parser %a) (Parser %sep) (Parser (List %a))))
+(defun (sep-by p sep)
+  (por (sep-by1 p sep) (preturn Nil)))
+
+;; The separator before the end is not followed by a p, so the loop has to be
+;; able to give it back — which sep-by1 cannot do and is the whole difference
+;; between the two.
+(: sep-end-by1 (-> (Parser %a) (Parser %sep) (Parser (List %a))))
+(defun (sep-end-by1 p sep)
+  (pleft (ppipe2 p (many (attempt (pright sep p))) (fun (x xs) (Cons x xs)))
+         (optional sep)))
+
+(: sep-end-by (-> (Parser %a) (Parser %sep) (Parser (List %a))))
+(defun (sep-end-by p sep)
+  (por (sep-end-by1 p sep) (preturn Nil)))
+
+(: opt (-> (Parser %a) (Parser (Option %a))))
+(defun (opt p)
+  (por (pmap (fun (x) (Some x)) p) (preturn None)))
+
+(: opt-or (-> (Parser %a) %a (Parser %a)))
+(defun (opt-or p fallback)
+  (por p (preturn fallback)))
+
+(: optional (-> (Parser %a) (Parser void)))
+(defun (optional p)
+  (por (pmap (fun (x) unit) p) (preturn unit)))
+
+;; One or more p, separated by an operator that says how to fold them.
+(: chainl1 (-> (Parser %a) (Parser (-> %a %a %a)) (Parser %a)))
+(defun (chainl1 p op)
+  (fun (st)
+    (match (p st)
+      ((ReplyErr e) (ReplyErr e))
+      ((ReplyOk first)
+       (let go ((acc first))
+         (def m (mark st))
+         (match (op st)
+           ((ReplyErr e)
+            (cond ((moved? st m) (ReplyErr e)) (else (ReplyOk acc))))
+           ((ReplyOk f)
+            (match (p st)
+              ((ReplyErr e) (ReplyErr e))
+              ((ReplyOk y) (go (f acc y)))))))))))
+
+(: chainr1 (-> (Parser %a) (Parser (-> %a %a %a)) (Parser %a)))
+(defun (chainr1 p op)
+  (fun (st)
+    (match (p st)
+      ((ReplyErr e) (ReplyErr e))
+      ((ReplyOk x)
+       (def m (mark st))
+       (match (op st)
+         ((ReplyErr e)
+          (cond ((moved? st m) (ReplyErr e)) (else (ReplyOk x))))
+         ((ReplyOk f)
+          (match ((chainr1 p op) st)
+            ((ReplyErr e) (ReplyErr e))
+            ((ReplyOk y) (ReplyOk (f x y))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Numbers
+;; ---------------------------------------------------------------------------
+;; Both restore the position when what follows the sign is not a number, so
+;; neither needs an attempt around it. Both throw on a literal too large for
+;; the type, which is .NET's answer and not a parse error.
+
+(: skip-sign! (-> State bool))
+(defun (skip-sign! st)
+  (or (skip-char! st #\-) (skip-char! st #\+)))
+
+(: pint (Parser int))
+(defun (pint st)
+  (def text (record-ref st text))
+  (def m (mark st))
+  (def start (record-ref st pos))
+  (ignore (skip-sign! st))
+  (cond
+    ((= 0 (skip-while! st ascii-digit?))
+     (reset! st m)
+     (ReplyErr (expected-found-error st "an integer")))
+    (else (ReplyOk (string->int (substring/cursors text start (record-ref st pos)))))))
+
+(: pdouble (Parser double))
+(defun (pdouble st)
+  (def text (record-ref st text))
+  (def m (mark st))
+  (def start (record-ref st pos))
+  (ignore (skip-sign! st))
+  (cond
+    ((= 0 (skip-while! st ascii-digit?))
+     (reset! st m)
+     (ReplyErr (expected-found-error st "a number")))
+    (else
+     (skip-fraction! st)
+     (skip-exponent! st)
+     (ReplyOk (string->double (substring/cursors text start (record-ref st pos)))))))
+
+;; A dot with no digit after it belongs to whatever comes next, not to the
+;; number, so it is given back.
+(: skip-fraction! (-> State void))
+(defun (skip-fraction! st)
+  (def m (mark st))
+  (when (skip-char! st #\.)
+    (when (= 0 (skip-while! st ascii-digit?))
+      (reset! st m))))
+
+(: skip-exponent! (-> State void))
+(defun (skip-exponent! st)
+  (def m (mark st))
+  (when (or (skip-char! st #\e) (skip-char! st #\E))
+    (ignore (skip-sign! st))
+    (when (= 0 (skip-while! st ascii-digit?))
+      (reset! st m))))
+
+;; ---------------------------------------------------------------------------
+;; Recursive grammars
+;; ---------------------------------------------------------------------------
+;; A grammar written as top-level defuns is recursive already. One built out of
+;; values needs a cell to refer to before it is filled, which is what a
+;; ParserRef is.
+
+(type
+  (: (ParserRef %a) (Record (: target (Parser %a) #:mutable))))
+
+(: pforward (-> (ParserRef %a)))
+(defun (pforward)
+  (ParserRef (target (pfail "this forward parser was never set"))))
+
+(: pforwarded (-> (ParserRef %a) (Parser %a)))
+(defun (pforwarded r)
+  (fun (st) ((record-ref r target) st)))
+
+(: pforward-set! (-> (ParserRef %a) (Parser %a) void))
+(defun (pforward-set! r p)
+  (record-set! r (target p)))
+
+;; Builds the parser on the first character it is asked about, which is the
+;; other way to tie a knot.
+(: plazy (-> (-> (Parser %a)) (Parser %a)))
+(defun (plazy thunk)
+  (fun (st) ((thunk) st)))
