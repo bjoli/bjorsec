@@ -1,4 +1,4 @@
-;; Playground/bjorsec.bjo
+;; bjorsec/src/core.bjo — the module (bjorsec core).
 ;;
 ;; Parser combinators, after FParsec.
 ;;

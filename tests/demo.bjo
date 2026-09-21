@@ -1,10 +1,14 @@
-;; Playground/bjorsec-demo.bjo
+;; tests/demo.bjo
 ;;
 ;; A calculator built out of bjorsec, and a check of every combinator it
 ;; exports. The import is a module boundary, so the checks also say that the
 ;; export list is complete.
+;;
+;; Run it with `bjo run tests/demo.bjo`: a file inside a project is compiled
+;; against the project's packages, which is what makes the module name below
+;; resolve.
 
-(import "bjorsec.bjo")
+(import (bjorsec core))
 (import (std simpletest))
 
 ;; ---------------------------------------------------------------------------

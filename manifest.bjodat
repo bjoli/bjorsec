@@ -1,0 +1,9 @@
+(package
+  (name (bjorsec))
+  (version "0.1.0")
+  (description "Parser combinators for Bjolang, after FParsec.")
+  (license "MPL-2.0")
+
+  ;; A library: there is no src/main.bjo, so `bjo build` builds every module
+  ;; under src/ instead of a program.
+  )
