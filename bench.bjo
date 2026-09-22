@@ -1,0 +1,68 @@
+(import (bjorsec core))
+(import (std stopwatch))
+
+(: token (-> (Parser %a) (Parser %a)))
+(defun (token p) (pleft p spaces))
+
+(: sym (-> char (Parser char)))
+(defun (sym c) (token (pchar c)))
+
+(: number (Parser double))
+(def number (token (plabel pdouble "a number")))
+
+(: expr-ref (ParserRef double))
+(def expr-ref (pforward))
+
+(: expr (Parser double))
+(def expr (pforwarded expr-ref))
+
+(: factor (Parser double))
+(def factor (por number (between (sym #\() (sym #\)) expr)))
+
+(: mul-op (Parser (-> double double double)))
+(def mul-op
+  (por (pright (sym #\*) (preturn (fun (a b) (* a b))))
+       (pright (sym #\/) (preturn (fun (a b) (/ a b))))))
+
+(: add-op (Parser (-> double double double)))
+(def add-op
+  (por (pright (sym #\+) (preturn (fun (a b) (+ a b))))
+       (pright (sym #\-) (preturn (fun (a b) (- a b))))))
+
+(: term (Parser double))
+(def term (chainl1 factor mul-op))
+
+(: sum (Parser double))
+(def sum (chainl1 term add-op))
+
+(: calculator (Parser double))
+(def calculator (pright spaces (pleft sum eof)))
+
+(defun (main args)
+  (pforward-set! expr-ref sum)
+
+  (def n 20000)
+  (def input
+    (let loop ((i 0) (acc Nil))
+      (if (= i n)
+          (string-join (list->vec acc) " + ")
+          (loop (+ i 1) (Cons "1" acc)))))
+
+  (println "Warming up JIT...")
+  (let loop ((i 0))
+    (when (< i 5)
+      (ignore (run-parser calculator input))
+      (loop (+ i 1))))
+
+  (println (str "Parsing " (int->string n) " elements 20 times..."))
+  (def sw (stopwatch))
+  (stopwatch-start! sw)
+  (let loop ((i 0) (acc 0.0))
+    (if (< i 20)
+        (match (run-parser calculator input)
+          ((Ok v) (loop (+ i 1) (+ acc v)))
+          ((Err e) (println (error->string e)) (loop (+ i 1) acc)))
+        (let ()
+          (stopwatch-stop! sw)
+          (println (str "Bjolang inner loop: " (->str (stopwatch-ms sw)) " ms (sum: " (double->string acc) ")")))))
+  0)
