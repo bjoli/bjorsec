@@ -20,9 +20,9 @@
 
 (export
   ;; types
-  State Mark Position ErrorItem ParseError Reply Parser ParserRef
+  State Mark Position ErrorItem ParseError Parser ParserRef
   ;; running a parser
-  make-state state-position run-parser run-parser/message error->string
+  make-state state-position run-parser run-parser/message error->string parse-error-position
   ;; primitives
   preturn pzero pfail pbind pmap pright pleft pboth ppipe2 ppipe3 psequence
   ;; choice, backtracking, errors
@@ -152,15 +152,19 @@
 ;; The source is carried so that an error can print the line it happened on
 ;; without the caller having to hand the text back.
 (type
-  (: ParseError (Record
+  (: ParseError (Struct
                   (: source string)
-                  (: position Position)
+                  (: err-pos StringCursor)
+                  (: err-line int)
+                  (: err-line-start StringCursor)
                   (: items (List ErrorItem)))))
 
 (: error-at (-> State (List ErrorItem) ParseError))
 (defun (error-at st xs)
   (ParseError (source (record-ref st text))
-              (position (state-position st))
+              (err-pos (record-ref st pos))
+              (err-line (record-ref st line))
+              (err-line-start (record-ref st line-start))
               (items xs)))
 
 (: expected-error (-> State string ParseError))
@@ -205,13 +209,15 @@
 ;; both expectations.
 (: error-merge (-> ParseError ParseError ParseError))
 (defun (error-merge a b)
-  (def pa (record-ref a position))
-  (def pb (record-ref b position))
+  (def pa (record-ref a err-pos))
+  (def pb (record-ref b err-pos))
   (cond
-    ((position<? pa pb) b)
-    ((position<? pb pa) a)
+    ((string-cursor<? pa pb) b)
+    ((string-cursor<? pb pa) a)
     (else (ParseError (source (record-ref a source))
-                      (position pa)
+                      (err-pos pa)
+                      (err-line (record-ref a err-line))
+                      (err-line-start (record-ref a err-line-start))
                       (items (list-append (record-ref a items) (record-ref b items)))))))
 
 ;; ---------------------------------------------------------------------------
@@ -273,9 +279,16 @@
     ((or (< n 1) (> n (vec-length lines))) None)
     (else (Some (string-trim-end (vec-ref lines (- n 1)))))))
 
+(: parse-error-position (-> ParseError Position))
+(defun (parse-error-position e)
+  (Position (line (record-ref e err-line))
+            (column (+ 1 (string-count (substring/cursors (record-ref e source)
+                                                          (record-ref e err-line-start)
+                                                          (record-ref e err-pos)))))))
+
 (: error->string (-> ParseError string))
 (defun (error->string e)
-  (def p (record-ref e position))
+  (def p (parse-error-position e))
   (def column (struct-ref p column))
   (def sb (stringbuilder-empty))
   (stringbuilder-add-string!
@@ -302,18 +315,13 @@
 ;; Parsers
 ;; ---------------------------------------------------------------------------
 
-(type
-  (: (Reply %a) (Union
-                  (ReplyOk %a)
-                  (ReplyErr ParseError))))
 
-(type (: (Parser %a) (-> State (Reply %a))))
+
+(type (: (Parser %a) (-> State (Result ParseError %a))))
 
 (: run-parser (-> (Parser %a) string (Result ParseError %a)))
 (defun (run-parser p text)
-  (match (p (make-state text))
-    ((ReplyOk v) (Ok v))
-    ((ReplyErr e) (Err e))))
+  (p (make-state text)))
 
 (: run-parser/message (-> (Parser %a) string (Result string %a)))
 (defun (run-parser/message p text)
@@ -327,41 +335,41 @@
 
 (: preturn (-> %a (Parser %a)))
 (defun (preturn v)
-  (fun (st) (ReplyOk v)))
+  (fun (st) (Ok v)))
 
 ;; Fails with nothing to say, which is what choice folds over and what an
 ;; expectation from elsewhere merges cleanly with.
 (: pzero (Parser %a))
 (defun (pzero st)
-  (ReplyErr (error-at st Nil)))
+  (Err (error-at st Nil)))
 
 (: pfail (-> string (Parser %a)))
 (defun (pfail msg)
-  (fun (st) (ReplyErr (message-error st msg))))
+  (fun (st) (Err (message-error st msg))))
 
 (: pbind (-> (Parser %a) (-> %a (Parser %b)) (Parser %b)))
 (defun (pbind p f)
   (fun (st)
     (match (p st)
-      ((ReplyOk v) ((f v) st))
-      ((ReplyErr e) (ReplyErr e)))))
+      ((Ok v) ((f v) st))
+      ((Err e) (Err e)))))
 
 (: pmap (-> (-> %a %b) (Parser %a) (Parser %b)))
 (defun (pmap f p)
   (fun (st)
     (match (p st)
-      ((ReplyOk v) (ReplyOk (f v)))
-      ((ReplyErr e) (ReplyErr e)))))
+      ((Ok v) (Ok (f v)))
+      ((Err e) (Err e)))))
 
 (: ppipe2 (-> (Parser %a) (Parser %b) (-> %a %b %c) (Parser %c)))
 (defun (ppipe2 p q f)
   (fun (st)
     (match (p st)
-      ((ReplyErr e) (ReplyErr e))
-      ((ReplyOk a)
+      ((Err e) (Err e))
+      ((Ok a)
        (match (q st)
-         ((ReplyErr e) (ReplyErr e))
-         ((ReplyOk b) (ReplyOk (f a b))))))))
+         ((Err e) (Err e))
+         ((Ok b) (Ok (f a b))))))))
 
 (: ppipe3 (-> (Parser %a) (Parser %b) (Parser %c) (-> %a %b %c %d) (Parser %d)))
 (defun (ppipe3 p q r f)
@@ -390,11 +398,11 @@
   (fun (st)
     (let go ((rest ps) (acc Nil))
       (match rest
-        (Nil (ReplyOk (list-reverse acc)))
+        (Nil (Ok (list-reverse acc)))
         ((Cons p more)
          (match (p st)
-           ((ReplyOk v) (go more (Cons v acc)))
-           ((ReplyErr e) (ReplyErr e))))))))
+           ((Ok v) (go more (Cons v acc)))
+           ((Err e) (Err e))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Choice and backtracking
@@ -405,14 +413,14 @@
   (fun (st)
     (def m (mark st))
     (match (p st)
-      ((ReplyOk v) (ReplyOk v))
-      ((ReplyErr e1)
+      ((Ok v) (Ok v))
+      ((Err e1)
        (cond
-         ((moved? st m) (ReplyErr e1))
+         ((moved? st m) (Err e1))
          (else
           (match (q st)
-            ((ReplyOk v) (ReplyOk v))
-            ((ReplyErr e2) (ReplyErr (error-merge e1 e2))))))))))
+            ((Ok v) (Ok v))
+            ((Err e2) (Err (error-merge e1 e2))))))))))
 
 (: choice (-> (List (Parser %a)) (Parser %a)))
 (defun (choice ps)
@@ -425,8 +433,8 @@
   (fun (st)
     (def m (mark st))
     (match (p st)
-      ((ReplyOk v) (ReplyOk v))
-      ((ReplyErr e) (reset! st m) (ReplyErr e)))))
+      ((Ok v) (Ok v))
+      ((Err e) (reset! st m) (Err e)))))
 
 (: look-ahead (-> (Parser %a) (Parser %a)))
 (defun (look-ahead p)
@@ -443,8 +451,8 @@
     (def reply (p st))
     (reset! st m)
     (match reply
-      ((ReplyOk v) (ReplyOk unit))
-      ((ReplyErr e) (ReplyErr (expected-error st what))))))
+      ((Ok v) (Ok unit))
+      ((Err e) (Err (expected-error st what))))))
 
 (: not-followed-by (-> (Parser %a) string (Parser void)))
 (defun (not-followed-by p what)
@@ -453,8 +461,8 @@
     (def reply (p st))
     (reset! st m)
     (match reply
-      ((ReplyOk v) (ReplyErr (error-at st (Cons (Unexpected what) Nil))))
-      ((ReplyErr e) (ReplyOk unit)))))
+      ((Ok v) (Err (error-at st (Cons (Unexpected what) Nil))))
+      ((Err e) (Ok unit)))))
 
 ;; Replaces what p expected, as long as p did not get anywhere: a failure
 ;; inside p that consumed input knows more than the label does.
@@ -463,15 +471,15 @@
   (fun (st)
     (def m (mark st))
     (match (p st)
-      ((ReplyOk v) (ReplyOk v))
-      ((ReplyErr e)
+      ((Ok v) (Ok v))
+      ((Err e)
        (cond
-         ((moved? st m) (ReplyErr e))
-         (else (ReplyErr (expected-error st what))))))))
+         ((moved? st m) (Err e))
+         (else (Err (expected-error st what))))))))
 
 (: pposition (Parser Position))
 (defun (pposition st)
-  (ReplyOk (state-position st)))
+  (Ok (state-position st)))
 
 ;; ---------------------------------------------------------------------------
 ;; Characters and strings
@@ -481,21 +489,21 @@
 (defun (satisfy pred what)
   (fun (st)
     (cond
-      ((at-end? st) (ReplyErr (expected-found-error st what)))
+      ((at-end? st) (Err (expected-found-error st what)))
       (else
        (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
        (cond
-         ((pred c) (advance! st c next) (ReplyOk c))
-         (else (ReplyErr (expected-found-error st what))))))))
+         ((pred c) (advance! st c next) (Ok c))
+         (else (Err (expected-found-error st what))))))))
 
 (: any-char (Parser char))
 (defun (any-char st)
   (cond
-    ((at-end? st) (ReplyErr (expected-found-error st "any character")))
+    ((at-end? st) (Err (expected-found-error st "any character")))
     (else
      (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
      (advance! st c next)
-     (ReplyOk c))))
+     (Ok c))))
 
 (: pchar (-> char (Parser char)))
 (defun (pchar c)
@@ -513,11 +521,27 @@
 
 (: any-of (-> string (Parser char)))
 (defun (any-of s)
-  (satisfy (fun (c) (char-in? c s)) (str "one of " (quoted s))))
+  (def what (str "one of " (quoted s)))
+  (fun (st)
+    (if (at-end? st)
+        (Err (expected-found-error st what))
+        (let ()
+          (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
+          (if (char-in? c s)
+              (let () (advance! st c next) (Ok c))
+              (Err (expected-found-error st what)))))))
 
 (: none-of (-> string (Parser char)))
 (defun (none-of s)
-  (satisfy (fun (c) (not (char-in? c s))) (str "a character other than " (quoted s))))
+  (def what (str "a character other than " (quoted s)))
+  (fun (st)
+    (if (at-end? st)
+        (Err (expected-found-error st what))
+        (let ()
+          (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
+          (if (char-in? c s)
+              (Err (expected-found-error st what))
+              (let () (advance! st c next) (Ok c)))))))
 
 ;; All or nothing: a half-matched literal leaves the cursor where it was, so a
 ;; choice between literals needs no attempt.
@@ -528,10 +552,10 @@
     (def text (record-ref st text))
     (let go ((sc (string-cursor-start s)))
       (cond
-        ((string-cursor-end? s sc) (ReplyOk s))
+        ((string-cursor-end? s sc) (Ok s))
         ((at-end? st)
          (reset! st m)
-         (ReplyErr (expected-found-error st (quoted s))))
+         (Err (expected-found-error st (quoted s))))
         (else
          (def (Tuple want wnext) (string-cursor-ref+next s sc))
          (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
@@ -539,7 +563,7 @@
            ((char=? want got) (advance! st got gnext) (go wnext))
            (else
             (reset! st m)
-            (ReplyErr (expected-found-error st (quoted s))))))))))
+            (Err (expected-found-error st (quoted s))))))))))
 
 (: pstring/ci (-> string (Parser string)))
 (defun (pstring/ci s)
@@ -550,10 +574,10 @@
     (let go ((sc (string-cursor-start s)))
       (cond
         ((string-cursor-end? s sc)
-         (ReplyOk (substring/cursors text start (record-ref st pos))))
+         (Ok (substring/cursors text start (record-ref st pos))))
         ((at-end? st)
          (reset! st m)
-         (ReplyErr (expected-found-error st (quoted s))))
+         (Err (expected-found-error st (quoted s))))
         (else
          (def (Tuple want wnext) (string-cursor-ref+next s sc))
          (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
@@ -561,7 +585,7 @@
            ((char-ci=? want got) (advance! st got gnext) (go wnext))
            (else
             (reset! st m)
-            (ReplyErr (expected-found-error st (quoted s))))))))))
+            (Err (expected-found-error st (quoted s))))))))))
 
 ;; The run of characters satisfying pred, as a string. Never fails.
 (: many-satisfy (-> (-> char bool) (Parser string)))
@@ -569,42 +593,81 @@
   (fun (st)
     (def start (record-ref st pos))
     (ignore (skip-while! st pred))
-    (ReplyOk (substring/cursors (record-ref st text) start (record-ref st pos)))))
+    (Ok (substring/cursors (record-ref st text) start (record-ref st pos)))))
 
 (: many-satisfy1 (-> (-> char bool) string (Parser string)))
 (defun (many-satisfy1 pred what)
   (fun (st)
     (def start (record-ref st pos))
     (cond
-      ((= 0 (skip-while! st pred)) (ReplyErr (expected-found-error st what)))
-      (else (ReplyOk (substring/cursors (record-ref st text) start (record-ref st pos)))))))
+      ((= 0 (skip-while! st pred)) (Err (expected-found-error st what)))
+      (else (Ok (substring/cursors (record-ref st text) start (record-ref st pos)))))))
 
 (: many-chars (-> (Parser char) (Parser string)))
 (defun (many-chars p)
-  (pmap list->string (many p)))
+  (fun (st)
+    (def b (stringbuilder-empty))
+    (let go ()
+      (def m (mark st))
+      (match (p st)
+        ((Err e)
+         (if (moved? st m)
+             (Err e)
+             (Ok (stringbuilder->string b))))
+        ((Ok c)
+         (stringbuilder-add! b c)
+         (go))))))
 
 (: many-chars1 (-> (Parser char) (Parser string)))
 (defun (many-chars1 p)
-  (pmap list->string (many1 p)))
+  (fun (st)
+    (def b (stringbuilder-empty))
+    (match (p st)
+      ((Err e) (Err e))
+      ((Ok c)
+       (stringbuilder-add! b c)
+       (let go ()
+         (def m (mark st))
+         (match (p st)
+           ((Err e)
+            (if (moved? st m)
+                (Err e)
+                (Ok (stringbuilder->string b))))
+           ((Ok c)
+            (stringbuilder-add! b c)
+            (go))))))))
 
-(: spaces (Parser void))
-(defun (spaces st)
-  (ignore (skip-while! st char-whitespace?))
-  (ReplyOk unit))
+(: spaces (Parser Unit))
+(def spaces
+  (fun (st)
+    (def text (record-ref st text))
+    (let go ()
+      (if (at-end? st)
+          (Ok unit)
+          (let ()
+            (def (Tuple c next) (string-cursor-ref+next text (record-ref st pos)))
+            (if (or (char=? c #\space)
+                    (char=? c #\tab)
+                    (char=? c #\newline)
+                    (char=? c #\return))
+                (let ()
+                  (advance! st c next)
+                  (go))
+                (Ok unit)))))))
 
 (: spaces1 (Parser void))
 (defun (spaces1 st)
   (cond
-    ((> (skip-while! st char-whitespace?) 0) (ReplyOk unit))
-    (else (ReplyErr (expected-found-error st "whitespace")))))
+    ((> (skip-while! st char-whitespace?) 0) (Ok unit))
+    (else (Err (expected-found-error st "whitespace")))))
 
 ;; A line ending in any of its three spellings, answering #\newline.
 (: pnewline (Parser char))
 (defun (pnewline st)
   (cond
-    ((skip-char! st #\return) (ignore (skip-char! st #\newline)) (ReplyOk #\newline))
-    ((skip-char! st #\newline) (ReplyOk #\newline))
-    (else (ReplyErr (expected-found-error st "a newline")))))
+    ((skip-char! st #\return) (ignore (skip-char! st #\newline)) (Ok #\newline))
+    ((skip-char! st #\newline) (Ok #\newline))
+    (else (Err (expected-found-error st "a newline")))))
 
 (: ascii-digit? (-> char bool))
 (defun (ascii-digit? c)
@@ -623,8 +686,8 @@
 (: eof (Parser void))
 (defun (eof st)
   (cond
-    ((at-end? st) (ReplyOk unit))
-    (else (ReplyErr (expected-found-error st "end of input")))))
+    ((at-end? st) (Ok unit))
+    (else (Err (expected-found-error st "end of input")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Repetition
@@ -638,14 +701,14 @@
     (let go ((acc init))
       (def m (mark st))
       (match (p st)
-        ((ReplyOk v)
+        ((Ok v)
          (cond
            ((moved? st m) (go (f v acc)))
            (else (panic! "bjorsec: a parser under many succeeded without consuming input"))))
-        ((ReplyErr e)
+        ((Err e)
          (cond
-           ((moved? st m) (ReplyErr e))
-           (else (ReplyOk acc))))))))
+           ((moved? st m) (Err e))
+           (else (Ok acc))))))))
 
 (: many (-> (Parser %a) (Parser (List %a))))
 (defun (many p)
@@ -670,25 +733,25 @@
     (let go ((acc Nil))
       (def m (mark st))
       (match (end st)
-        ((ReplyOk v) (ReplyOk (list-reverse acc)))
-        ((ReplyErr e1)
+        ((Ok v) (Ok (list-reverse acc)))
+        ((Err e1)
          (cond
-           ((moved? st m) (ReplyErr e1))
+           ((moved? st m) (Err e1))
            (else
             (match (p st)
-              ((ReplyOk v) (go (Cons v acc)))
-              ((ReplyErr e2) (ReplyErr (error-merge e1 e2)))))))))))
+              ((Ok v) (go (Cons v acc)))
+              ((Err e2) (Err (error-merge e1 e2)))))))))))
 
 (: prepeat (-> int (Parser %a) (Parser (List %a))))
 (defun (prepeat n p)
   (fun (st)
     (let go ((i 0) (acc Nil))
       (cond
-        ((>= i n) (ReplyOk (list-reverse acc)))
+        ((>= i n) (Ok (list-reverse acc)))
         (else
          (match (p st)
-           ((ReplyOk v) (go (+ i 1) (Cons v acc)))
-           ((ReplyErr e) (ReplyErr e))))))))
+           ((Ok v) (go (+ i 1) (Cons v acc)))
+           ((Err e) (Err e))))))))
 
 (: sep-by1 (-> (Parser %a) (Parser %sep) (Parser (List %a))))
 (defun (sep-by1 p sep)
@@ -727,32 +790,32 @@
 (defun (chainl1 p op)
   (fun (st)
     (match (p st)
-      ((ReplyErr e) (ReplyErr e))
-      ((ReplyOk first)
+      ((Err e) (Err e))
+      ((Ok first)
        (let go ((acc first))
          (def m (mark st))
          (match (op st)
-           ((ReplyErr e)
-            (cond ((moved? st m) (ReplyErr e)) (else (ReplyOk acc))))
-           ((ReplyOk f)
+           ((Err e)
+            (cond ((moved? st m) (Err e)) (else (Ok acc))))
+           ((Ok f)
             (match (p st)
-              ((ReplyErr e) (ReplyErr e))
-              ((ReplyOk y) (go (f acc y)))))))))))
+              ((Err e) (Err e))
+              ((Ok y) (go (f acc y)))))))))))
 
 (: chainr1 (-> (Parser %a) (Parser (-> %a %a %a)) (Parser %a)))
 (defun (chainr1 p op)
   (fun (st)
     (match (p st)
-      ((ReplyErr e) (ReplyErr e))
-      ((ReplyOk x)
+      ((Err e) (Err e))
+      ((Ok x)
        (def m (mark st))
        (match (op st)
-         ((ReplyErr e)
-          (cond ((moved? st m) (ReplyErr e)) (else (ReplyOk x))))
-         ((ReplyOk f)
+         ((Err e)
+          (cond ((moved? st m) (Err e)) (else (Ok x))))
+         ((Ok f)
           (match ((chainr1 p op) st)
-            ((ReplyErr e) (ReplyErr e))
-            ((ReplyOk y) (ReplyOk (f x y))))))))))
+            ((Err e) (Err e))
+            ((Ok y) (Ok (f x y))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Numbers
@@ -765,6 +828,18 @@
 (defun (skip-sign! st)
   (or (skip-char! st #\-) (skip-char! st #\+)))
 
+(: skip-digits! (-> State int))
+(defun (skip-digits! st)
+  (def text (record-ref st text))
+  (let go ((n 0))
+    (if (at-end? st)
+        n
+        (let ()
+          (def (Tuple c next) (string-cursor-ref+next text (record-ref st pos)))
+          (if (ascii-digit? c)
+              (let () (advance! st c next) (go (+ n 1)))
+              n)))))
+
 (: pint (Parser int))
 (defun (pint st)
   (def text (record-ref st text))
@@ -772,10 +847,10 @@
   (def start (record-ref st pos))
   (ignore (skip-sign! st))
   (cond
-    ((= 0 (skip-while! st ascii-digit?))
+    ((= 0 (skip-digits! st))
      (reset! st m)
-     (ReplyErr (expected-found-error st "an integer")))
-    (else (ReplyOk (string->int (substring/cursors text start (record-ref st pos)))))))
+     (Err (expected-found-error st "an integer")))
+    (else (Ok (string->int (substring/cursors text start (record-ref st pos)))))))
 
 (: pdouble (Parser double))
 (defun (pdouble st)
@@ -784,13 +859,13 @@
   (def start (record-ref st pos))
   (ignore (skip-sign! st))
   (cond
-    ((= 0 (skip-while! st ascii-digit?))
+    ((= 0 (skip-digits! st))
      (reset! st m)
-     (ReplyErr (expected-found-error st "a number")))
+     (Err (expected-found-error st "a number")))
     (else
      (skip-fraction! st)
      (skip-exponent! st)
-     (ReplyOk (string->double (substring/cursors text start (record-ref st pos)))))))
+     (Ok (string->double (substring/cursors text start (record-ref st pos)))))))
 
 ;; A dot with no digit after it belongs to whatever comes next, not to the
 ;; number, so it is given back.
@@ -798,7 +873,7 @@
 (defun (skip-fraction! st)
   (def m (mark st))
   (when (skip-char! st #\.)
-    (when (= 0 (skip-while! st ascii-digit?))
+    (when (= 0 (skip-digits! st))
       (reset! st m))))
 
 (: skip-exponent! (-> State void))
@@ -806,7 +881,7 @@
   (def m (mark st))
   (when (or (skip-char! st #\e) (skip-char! st #\E))
     (ignore (skip-sign! st))
-    (when (= 0 (skip-while! st ascii-digit?))
+    (when (= 0 (skip-digits! st))
       (reset! st m))))
 
 ;; ---------------------------------------------------------------------------
