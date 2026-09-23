@@ -103,8 +103,14 @@
   (show "choice merges earlier then stops"
         (err (choice (list (pchar #\q) (pright (pchar #\a) (pchar #\b)) (pchar #\a))) "ax"))
 
-  (show "ok: calc 1 + 2 * 3" (okv calculator "1 + 2 * 3"))
-  (show "ok: calc -2 * 3" (okv calculator "-2 * 3"))
+  (def/mutable thunk-runs 0)
+  (def lazy-a (plazy (fun () (set! thunk-runs (+ thunk-runs 1)) (pchar #\a))))
+  (ignore (run-parser lazy-a "a"))
+  (ignore (run-parser lazy-a "a"))
+  (ignore (run-parser lazy-a "a"))
+  (show "plazy thunk runs once" (->str thunk-runs))
+
+  (show "ok: calc 1 + 2 * 3" (okv calculator "1 + 2 * 3"))  (show "ok: calc -2 * 3" (okv calculator "-2 * 3"))
   (show "ok: por hello" (okv (por (pstring "hello") (pstring "world")) "hello"))
   (show "ok: pint -42" (okv pint "-42"))
   (show "ok: pdouble 3.5e2" (okv pdouble "3.5e2"))

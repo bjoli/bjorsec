@@ -984,8 +984,17 @@
 (defun (pforward-set! r p)
   (record-set! r (target p)))
 
-;; Builds the parser on the first character it is asked about, which is the
-;; other way to tie a knot.
+;; Builds the parser on first use and keeps it, which is the other way to tie a
+;; knot. The cell is filled once, so the thunk does not run again.
+(type
+  (: (LazyCell %a) (Record (: built (Option (Parser %a)) #:mutable))))
+
 (: plazy (-> (-> (Parser %a)) (Parser %a)))
 (defun (plazy thunk)
-  (fun (st) ((thunk) st)))
+  (def cell (LazyCell (built None)))
+  (fun (st)
+    (match (record-ref cell built)
+      ((Some p) (p st))
+      (None (def p (thunk))
+            (record-set! cell (built (Some p)))
+            (p st)))))
