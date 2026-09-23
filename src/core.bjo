@@ -20,7 +20,7 @@
 
 (export
   ;; types
-  State Mark Position ErrorItem ErrorItems ParseError Parser ParserRef
+  State Mark Position ErrorItem ErrorItems Failure ParseError Parser ParserRef
   ;; running a parser
   make-state state-position run-parser run-parser/message error->string parse-error-position
   ;; primitives
@@ -162,8 +162,16 @@
 ;; from elsewhere merges cleanly with.
 (def no-items ItemsNone)
 
-;; The source is carried so that an error can print the line it happened on
-;; without the caller having to hand the text back.
+;; What a parser hands back when it fails: only what cannot be recovered later,
+;; the position and the expectations. The source, the line and the line start
+;; are worked out once by `run-parser`, so a reply carries far less.
+(type
+  (: Failure #:opaque (Struct
+                        (: err-pos StringCursor)
+                        (: items ErrorItems))))
+
+;; The public error. Built by `run-parser`, so a user of a parser still gets a
+;; `ParseError` carrying the source and the line exactly as before.
 (type
   (: ParseError (Struct
                   (: source string)
@@ -172,13 +180,10 @@
                   (: err-line-start StringCursor)
                   (: items ErrorItems))))
 
-(: error-at (-> State ErrorItems ParseError))
-(defun (error-at st xs)
-  (ParseError (source (record-ref st text))
-              (err-pos (record-ref st pos))
-              (err-line (record-ref st line))
-              (err-line-start (record-ref st line-start))
-              (items xs)))
+(: failure-at (-> State ErrorItems Failure))
+(defun (failure-at st xs)
+  (Failure (err-pos (record-ref st pos))
+           (items xs)))
 
 ;; The item tree for a fixed expectation, built once when a parser is made
 ;; rather than on every failure. A failing parser then allocates nothing.
@@ -238,18 +243,15 @@
 
 ;; The error that got further wins; two at the same place become one listing
 ;; both expectations.
-(: error-merge (-> ParseError ParseError ParseError))
+(: error-merge (-> Failure Failure Failure))
 (defun (error-merge a b)
   (def pa (record-ref a err-pos))
   (def pb (record-ref b err-pos))
   (cond
     ((string-cursor<? pa pb) b)
     ((string-cursor<? pb pa) a)
-    (else (ParseError (source (record-ref a source))
-                      (err-pos pa)
-                      (err-line (record-ref a err-line))
-                      (err-line-start (record-ref a err-line-start))
-                      (items (items-merge (record-ref a items) (record-ref b items)))))))
+    (else (Failure (err-pos pa)
+                   (items (items-merge (record-ref a items) (record-ref b items)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Reporting
@@ -356,11 +358,31 @@
 
 
 
-(type (: (Parser %a) (-> State (Result ParseError %a))))
+(type (: (Parser %a) (-> State (Result Failure %a))))
+
+(: failure->error (-> Failure string ParseError))
+(defun (failure->error f text)
+  (let go ((sc (string-cursor-start text))
+           (line 1)
+           (line-start (string-cursor-start text)))
+    (cond
+      ((string-cursor=? sc (record-ref f err-pos))
+       (ParseError (source text)
+                   (err-pos sc)
+                   (err-line line)
+                   (err-line-start line-start)
+                   (items (record-ref f items))))
+      (else
+       (def (Tuple c next) (string-cursor-ref+next text sc))
+       (cond
+         ((char=? c #\newline) (go next (+ line 1) next))
+         (else (go next line line-start)))))))
 
 (: run-parser (-> (Parser %a) string (Result ParseError %a)))
 (defun (run-parser p text)
-  (p (make-state text)))
+  (match (p (make-state text))
+    ((Ok v) (Ok v))
+    ((Err f) (Err (failure->error f text)))))
 
 (: run-parser/message (-> (Parser %a) string (Result string %a)))
 (defun (run-parser/message p text)
@@ -380,12 +402,12 @@
 ;; expectation from elsewhere merges cleanly with.
 (: pzero (Parser %a))
 (defun (pzero st)
-  (Err (error-at st no-items)))
+  (Err (failure-at st no-items)))
 
 (: pfail (-> string (Parser %a)))
 (defun (pfail msg)
   (def items (message-items msg))
-  (fun (st) (Err (error-at st items))))
+  (fun (st) (Err (failure-at st items))))
 
 (: pbind (-> (Parser %a) (-> %a (Parser %b)) (Parser %b)))
 (defun (pbind p f)
@@ -497,7 +519,7 @@
 (defun (choice ps)
   (fun (st)
     (def m (mark st))
-    (let go ((rest ps) (acc (error-at st no-items)))
+    (let go ((rest ps) (acc (failure-at st no-items)))
       (match rest
         (Nil (Err acc))
         ((Cons p more)
@@ -537,7 +559,7 @@
     (reset! st m)
     (match reply
       ((Ok v) (Ok unit))
-      ((Err e) (Err (error-at st items))))))
+      ((Err e) (Err (failure-at st items))))))
 
 (: not-followed-by (-> (Parser %a) string (Parser void)))
 (defun (not-followed-by p what)
@@ -547,7 +569,7 @@
     (def reply (p st))
     (reset! st m)
     (match reply
-      ((Ok v) (Err (error-at st items)))
+      ((Ok v) (Err (failure-at st items)))
       ((Err e) (Ok unit)))))
 
 ;; Replaces what p expected, as long as p did not get anywhere: a failure
@@ -562,7 +584,7 @@
       ((Err e)
        (cond
          ((moved? st m) (Err e))
-         (else (Err (error-at st items))))))))
+         (else (Err (failure-at st items))))))))
 
 (: pposition (Parser Position))
 (defun (pposition st)
@@ -577,12 +599,12 @@
   (def items (expected-items what))
   (fun (st)
     (cond
-      ((at-end? st) (Err (error-at st items)))
+      ((at-end? st) (Err (failure-at st items)))
       (else
        (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
        (cond
          ((pred c) (advance! st c next) (Ok c))
-         (else (Err (error-at st items))))))))
+         (else (Err (failure-at st items))))))))
 
 (: any-char-items ErrorItems)
 (def any-char-items (expected-items "any character"))
@@ -590,7 +612,7 @@
 (: any-char (Parser char))
 (defun (any-char st)
   (cond
-    ((at-end? st) (Err (error-at st any-char-items)))
+    ((at-end? st) (Err (failure-at st any-char-items)))
     (else
      (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
      (advance! st c next)
@@ -620,23 +642,23 @@
   (def items (expected-items (str "one of " (quoted s))))
   (fun (st)
     (if (at-end? st)
-        (Err (error-at st items))
+        (Err (failure-at st items))
         (let ()
           (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
           (if (char-in? c s)
               (let () (advance! st c next) (Ok c))
-              (Err (error-at st items)))))))
+              (Err (failure-at st items)))))))
 
 (: none-of (-> string (Parser char)))
 (defun (none-of s)
   (def items (expected-items (str "a character other than " (quoted s))))
   (fun (st)
     (if (at-end? st)
-        (Err (error-at st items))
+        (Err (failure-at st items))
         (let ()
           (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
           (if (char-in? c s)
-              (Err (error-at st items))
+              (Err (failure-at st items))
               (let () (advance! st c next) (Ok c)))))))
 
 ;; All or nothing: a half-matched literal leaves the cursor where it was, so a
@@ -652,7 +674,7 @@
         ((string-cursor-end? s sc) (Ok s))
         ((at-end? st)
          (reset! st m)
-         (Err (error-at st items)))
+         (Err (failure-at st items)))
         (else
          (def (Tuple want wnext) (string-cursor-ref+next s sc))
          (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
@@ -660,7 +682,7 @@
            ((char=? want got) (advance! st got gnext) (go wnext))
            (else
             (reset! st m)
-            (Err (error-at st items)))))))))
+            (Err (failure-at st items)))))))))
 
 (: pstring/ci (-> string (Parser string)))
 (defun (pstring/ci s)
@@ -675,7 +697,7 @@
          (Ok (substring/cursors text start (record-ref st pos))))
         ((at-end? st)
          (reset! st m)
-         (Err (error-at st items)))
+         (Err (failure-at st items)))
         (else
          (def (Tuple want wnext) (string-cursor-ref+next s sc))
          (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
@@ -683,7 +705,7 @@
            ((char-ci=? want got) (advance! st got gnext) (go wnext))
            (else
             (reset! st m)
-            (Err (error-at st items)))))))))
+            (Err (failure-at st items)))))))))
 
 ;; The run of characters satisfying pred, as a string. Never fails.
 (: many-satisfy (-> (-> char bool) (Parser string)))
@@ -699,7 +721,7 @@
   (fun (st)
     (def start (record-ref st pos))
     (cond
-      ((= 0 (skip-while! st pred)) (Err (error-at st items)))
+      ((= 0 (skip-while! st pred)) (Err (failure-at st items)))
       (else (Ok (substring/cursors (record-ref st text) start (record-ref st pos)))))))
 
 (: many-chars (-> (Parser char) (Parser string)))
@@ -761,7 +783,7 @@
 (defun (spaces1 st)
   (cond
     ((> (skip-while! st char-whitespace?) 0) (Ok unit))
-    (else (Err (error-at st spaces1-items)))))
+    (else (Err (failure-at st spaces1-items)))))
 
 ;; A line ending in any of its three spellings, answering #\newline.
 (: pnewline-items ErrorItems)
@@ -772,7 +794,7 @@
   (cond
     ((skip-char! st #\return) (ignore (skip-char! st #\newline)) (Ok #\newline))
     ((skip-char! st #\newline) (Ok #\newline))
-    (else (Err (error-at st pnewline-items)))))
+    (else (Err (failure-at st pnewline-items)))))
 
 (: ascii-digit? (-> char bool))
 (defun (ascii-digit? c)
@@ -795,7 +817,7 @@
 (defun (eof st)
   (cond
     ((at-end? st) (Ok unit))
-    (else (Err (error-at st eof-items)))))
+    (else (Err (failure-at st eof-items)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Repetition
@@ -992,7 +1014,7 @@
   (cond
     ((= 0 (skip-digits! st))
      (reset! st m)
-     (Err (error-at st pint-items)))
+     (Err (failure-at st pint-items)))
     (else (Ok (string->int (substring/cursors text start (record-ref st pos)))))))
 
 (: pdouble-items ErrorItems)
@@ -1007,7 +1029,7 @@
   (cond
     ((= 0 (skip-digits! st))
      (reset! st m)
-     (Err (error-at st pdouble-items)))
+     (Err (failure-at st pdouble-items)))
     (else
      (skip-fraction! st)
      (skip-exponent! st)
