@@ -606,9 +606,14 @@
 
 (: char-in? (-> char string bool))
 (defun (char-in? c s)
-  (match (string-index #(char=? & c) s)
-    ((Some found) #t)
-    (None #f)))
+  (let go ((sc (string-cursor-start s)))
+    (cond
+      ((string-cursor-end? s sc) #f)
+      (else
+       (def (Tuple got next) (string-cursor-ref+next s sc))
+       (cond
+         ((char=? got c) #t)
+         (else (go next)))))))
 
 (: any-of (-> string (Parser char)))
 (defun (any-of s)
