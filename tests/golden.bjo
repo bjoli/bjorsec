@@ -47,6 +47,9 @@
 (: calculator (Parser double))
 (def calculator (pright spaces (pleft sum eof)))
 
+(: minus-op (Parser (-> int int int)))
+(def minus-op (pright (pchar #\-) (preturn (fun (a b) (- a b)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Helpers
 ;; ---------------------------------------------------------------------------
@@ -114,4 +117,12 @@
   (show "ok: por hello" (okv (por (pstring "hello") (pstring "world")) "hello"))
   (show "ok: pint -42" (okv pint "-42"))
   (show "ok: pdouble 3.5e2" (okv pdouble "3.5e2"))
+
+  (def big-n 100000)
+  (def big-input
+    (let loop ((i 0) (acc Nil))
+      (if (= i big-n)
+          (string-join (list->vec acc) "-")
+          (loop (+ i 1) (Cons "1" acc)))))
+  (show "ok: chainr1 100000 terms" (okv (chainr1 pint minus-op) big-input))
   0)

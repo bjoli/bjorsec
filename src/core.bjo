@@ -413,16 +413,46 @@
 
 (: ppipe3 (-> (Parser %a) (Parser %b) (Parser %c) (-> %a %b %c %d) (Parser %d)))
 (defun (ppipe3 p q r f)
-  (ppipe2 (pboth p q) r (fun (ab c) (match ab ((Tuple a b) (f a b c))))))
+  (fun (st)
+    (match (p st)
+      ((Err e) (Err e))
+      ((Ok a)
+       (match (q st)
+         ((Err e) (Err e))
+         ((Ok b)
+          (match (r st)
+            ((Err e) (Err e))
+            ((Ok c) (Ok (f a b c))))))))))
 
 (: pright (-> (Parser %a) (Parser %b) (Parser %b)))
-(defun (pright p q) (ppipe2 p q (fun (_ b) b)))
+(defun (pright p q)
+  (fun (st)
+    (match (p st)
+      ((Err e) (Err e))
+      ((Ok _)
+       (match (q st)
+         ((Err e) (Err e))
+         ((Ok b) (Ok b)))))))
 
 (: pleft (-> (Parser %a) (Parser %b) (Parser %a)))
-(defun (pleft p q) (ppipe2 p q (fun (a _) a)))
+(defun (pleft p q)
+  (fun (st)
+    (match (p st)
+      ((Err e) (Err e))
+      ((Ok a)
+       (match (q st)
+         ((Err e) (Err e))
+         ((Ok _) (Ok a)))))))
 
 (: pboth (-> (Parser %a) (Parser %b) (Parser (Tuple %a %b))))
-(defun (pboth p q) (ppipe2 p q (fun (a b) (Tuple a b))))
+(defun (pboth p q)
+  (fun (st)
+    (match (p st)
+      ((Err e) (Err e))
+      ((Ok a)
+       (match (q st)
+         ((Err e) (Err e))
+         ((Ok b) (Ok (Tuple a b))))))))
 
 (: between (-> (Parser %open) (Parser %close) (Parser %a) (Parser %a)))
 (defun (between popen pclose p)
@@ -436,12 +466,13 @@
 (: psequence (-> (List (Parser %a)) (Parser (List %a))))
 (defun (psequence ps)
   (fun (st)
-    (let go ((rest ps) (acc Nil))
+    (def b (listbuilder-empty))
+    (let go ((rest ps))
       (match rest
-        (Nil (Ok (list-reverse acc)))
+        (Nil (Ok (listbuilder->list b)))
         ((Cons p more)
          (match (p st)
-           ((Ok v) (go more (Cons v acc)))
+           ((Ok v) (listbuilder-add! b v) (go more))
            ((Err e) (Err e))))))))
 
 ;; ---------------------------------------------------------------------------
@@ -784,7 +815,19 @@
 
 (: many (-> (Parser %a) (Parser (List %a))))
 (defun (many p)
-  (pmap list-reverse (many-fold (fun (x acc) (Cons x acc)) Nil p)))
+  (fun (st)
+    (def b (listbuilder-empty))
+    (let go ()
+      (def m (mark st))
+      (match (p st)
+        ((Ok v)
+         (cond
+           ((moved? st m) (listbuilder-add! b v) (go))
+           (else (panic! "bjorsec: a parser under many succeeded without consuming input"))))
+        ((Err e)
+         (cond
+           ((moved? st m) (Err e))
+           (else (Ok (listbuilder->list b)))))))))
 
 (: many1 (-> (Parser %a) (Parser (List %a))))
 (defun (many1 p)
@@ -802,27 +845,29 @@
 (: many-till (-> (Parser %a) (Parser %end) (Parser (List %a))))
 (defun (many-till p end)
   (fun (st)
-    (let go ((acc Nil))
+    (def b (listbuilder-empty))
+    (let go ()
       (def m (mark st))
       (match (end st)
-        ((Ok v) (Ok (list-reverse acc)))
+        ((Ok v) (Ok (listbuilder->list b)))
         ((Err e1)
          (cond
            ((moved? st m) (Err e1))
            (else
             (match (p st)
-              ((Ok v) (go (Cons v acc)))
+              ((Ok v) (listbuilder-add! b v) (go))
               ((Err e2) (Err (error-merge e1 e2)))))))))))
 
 (: prepeat (-> int (Parser %a) (Parser (List %a))))
 (defun (prepeat n p)
   (fun (st)
-    (let go ((i 0) (acc Nil))
+    (def b (listbuilder-empty))
+    (let go ((i 0))
       (cond
-        ((>= i n) (Ok (list-reverse acc)))
+        ((>= i n) (Ok (listbuilder->list b)))
         (else
          (match (p st)
-           ((Ok v) (go (+ i 1) (Cons v acc)))
+           ((Ok v) (listbuilder-add! b v) (go (+ i 1)))
            ((Err e) (Err e))))))))
 
 (: sep-by1 (-> (Parser %a) (Parser %sep) (Parser (List %a))))
@@ -874,20 +919,38 @@
               ((Err e) (Err e))
               ((Ok y) (go (f acc y)))))))))))
 
+(: chainr-fold (-> %a (List (-> %a %a %a)) (List %a) %a))
+(defun (chainr-fold x0 ops-rev vals-rev)
+  (match ops-rev
+    (Nil x0)
+    ((Cons _ _)
+     (let go ((acc (list-head vals-rev)) (ops ops-rev) (vals (list-tail vals-rev)))
+       (match ops
+         (Nil acc)
+         ((Cons f more)
+          ;; The last operator left takes the first operand, which was not part
+          ;; of the collected pairs.
+          (cond
+            ((list-empty? vals) (go (f x0 acc) more Nil))
+            (else (go (f (list-head vals) acc) more (list-tail vals))))))))))
+
 (: chainr1 (-> (Parser %a) (Parser (-> %a %a %a)) (Parser %a)))
 (defun (chainr1 p op)
   (fun (st)
     (match (p st)
       ((Err e) (Err e))
-      ((Ok x)
-       (def m (mark st))
-       (match (op st)
-         ((Err e)
-          (cond ((moved? st m) (Err e)) (else (Ok x))))
-         ((Ok f)
-          (match ((chainr1 p op) st)
-            ((Err e) (Err e))
-            ((Ok y) (Ok (f x y))))))))))
+      ((Ok first)
+       (let collect ((ops Nil) (vals Nil))
+         (def m (mark st))
+         (match (op st)
+           ((Err e)
+            (cond
+              ((moved? st m) (Err e))
+              (else (Ok (chainr-fold first ops vals)))))
+           ((Ok f)
+            (match (p st)
+              ((Err e) (Err e))
+              ((Ok y) (collect (Cons f ops) (Cons y vals)))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Numbers
