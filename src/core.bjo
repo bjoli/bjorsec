@@ -167,24 +167,24 @@
               (err-line-start (record-ref st line-start))
               (items xs)))
 
-(: expected-error (-> State string ParseError))
-(defun (expected-error st what)
-  (error-at st (Cons (Expected what) Nil)))
+;; The item list for a fixed expectation, built once when a parser is made
+;; rather than on every failure. A failing parser then allocates nothing.
+(: expected-items (-> string (List ErrorItem)))
+(defun (expected-items what)
+  (Cons (Expected what) Nil))
 
-(: message-error (-> State string ParseError))
-(defun (message-error st msg)
-  (error-at st (Cons (ErrorMessage msg) Nil)))
+(: message-items (-> string (List ErrorItem)))
+(defun (message-items msg)
+  (Cons (ErrorMessage msg) Nil))
 
-;; The character at the cursor, as a message names it.
-(: found (-> State string))
-(defun (found st)
+;; The character at a cursor, as a message names it. Used when printing an
+;; error, not while parsing: the error carries the position, so nothing on the
+;; parse path has to read the character to describe it.
+(: found (-> string StringCursor string))
+(defun (found text cursor)
   (cond
-    ((at-end? st) "end of input")
-    (else (char-name (string-cursor-ref (record-ref st text) (record-ref st pos))))))
-
-(: expected-found-error (-> State string ParseError))
-(defun (expected-found-error st what)
-  (error-at st (Cons (Expected what) (Cons (Unexpected (found st)) Nil))))
+    ((string-cursor-end? text cursor) "end of input")
+    (else (char-name (string-cursor-ref text cursor)))))
 
 (: char-name (-> char string))
 (defun (char-name c)
@@ -299,7 +299,14 @@
      (stringbuilder-add-string! sb (str "\n" text "\n" (string-pad-left "^" column))))
     (None unit))
   (def expected (expected-strings (record-ref e items)))
-  (def unexpected (unexpected-strings (record-ref e items)))
+  ;; The character at the error position is shown when the error also has
+  ;; expectations: a parser that only knows what it wanted still says what it
+  ;; found. An error carrying no expectation is printed as it was written.
+  (def unexpected
+    (if (list-empty? expected)
+        (unexpected-strings (record-ref e items))
+        (unique (list-append (unexpected-strings (record-ref e items))
+                             (Cons (found (record-ref e source) (record-ref e err-pos)) Nil)))))
   (unless (list-empty? expected)
     (stringbuilder-add-string! sb (str "\nExpecting: " (or-join expected))))
   (unless (list-empty? unexpected)
@@ -345,7 +352,8 @@
 
 (: pfail (-> string (Parser %a)))
 (defun (pfail msg)
-  (fun (st) (Err (message-error st msg))))
+  (def items (message-items msg))
+  (fun (st) (Err (error-at st items))))
 
 (: pbind (-> (Parser %a) (-> %a (Parser %b)) (Parser %b)))
 (defun (pbind p f)
@@ -446,28 +454,31 @@
 
 (: followed-by (-> (Parser %a) string (Parser void)))
 (defun (followed-by p what)
+  (def items (expected-items what))
   (fun (st)
     (def m (mark st))
     (def reply (p st))
     (reset! st m)
     (match reply
       ((Ok v) (Ok unit))
-      ((Err e) (Err (expected-error st what))))))
+      ((Err e) (Err (error-at st items))))))
 
 (: not-followed-by (-> (Parser %a) string (Parser void)))
 (defun (not-followed-by p what)
+  (def items (Cons (Unexpected what) Nil))
   (fun (st)
     (def m (mark st))
     (def reply (p st))
     (reset! st m)
     (match reply
-      ((Ok v) (Err (error-at st (Cons (Unexpected what) Nil))))
+      ((Ok v) (Err (error-at st items)))
       ((Err e) (Ok unit)))))
 
 ;; Replaces what p expected, as long as p did not get anywhere: a failure
 ;; inside p that consumed input knows more than the label does.
 (: plabel (-> (Parser %a) string (Parser %a)))
 (defun (plabel p what)
+  (def items (expected-items what))
   (fun (st)
     (def m (mark st))
     (match (p st)
@@ -475,7 +486,7 @@
       ((Err e)
        (cond
          ((moved? st m) (Err e))
-         (else (Err (expected-error st what))))))))
+         (else (Err (error-at st items))))))))
 
 (: pposition (Parser Position))
 (defun (pposition st)
@@ -487,19 +498,23 @@
 
 (: satisfy (-> (-> char bool) string (Parser char)))
 (defun (satisfy pred what)
+  (def items (expected-items what))
   (fun (st)
     (cond
-      ((at-end? st) (Err (expected-found-error st what)))
+      ((at-end? st) (Err (error-at st items)))
       (else
        (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
        (cond
          ((pred c) (advance! st c next) (Ok c))
-         (else (Err (expected-found-error st what))))))))
+         (else (Err (error-at st items))))))))
+
+(: any-char-items (List ErrorItem))
+(def any-char-items (expected-items "any character"))
 
 (: any-char (Parser char))
 (defun (any-char st)
   (cond
-    ((at-end? st) (Err (expected-found-error st "any character")))
+    ((at-end? st) (Err (error-at st any-char-items)))
     (else
      (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
      (advance! st c next)
@@ -521,32 +536,33 @@
 
 (: any-of (-> string (Parser char)))
 (defun (any-of s)
-  (def what (str "one of " (quoted s)))
+  (def items (expected-items (str "one of " (quoted s))))
   (fun (st)
     (if (at-end? st)
-        (Err (expected-found-error st what))
+        (Err (error-at st items))
         (let ()
           (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
           (if (char-in? c s)
               (let () (advance! st c next) (Ok c))
-              (Err (expected-found-error st what)))))))
+              (Err (error-at st items)))))))
 
 (: none-of (-> string (Parser char)))
 (defun (none-of s)
-  (def what (str "a character other than " (quoted s)))
+  (def items (expected-items (str "a character other than " (quoted s))))
   (fun (st)
     (if (at-end? st)
-        (Err (expected-found-error st what))
+        (Err (error-at st items))
         (let ()
           (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
           (if (char-in? c s)
-              (Err (expected-found-error st what))
+              (Err (error-at st items))
               (let () (advance! st c next) (Ok c)))))))
 
 ;; All or nothing: a half-matched literal leaves the cursor where it was, so a
 ;; choice between literals needs no attempt.
 (: pstring (-> string (Parser string)))
 (defun (pstring s)
+  (def items (expected-items (quoted s)))
   (fun (st)
     (def m (mark st))
     (def text (record-ref st text))
@@ -555,7 +571,7 @@
         ((string-cursor-end? s sc) (Ok s))
         ((at-end? st)
          (reset! st m)
-         (Err (expected-found-error st (quoted s))))
+         (Err (error-at st items)))
         (else
          (def (Tuple want wnext) (string-cursor-ref+next s sc))
          (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
@@ -563,10 +579,11 @@
            ((char=? want got) (advance! st got gnext) (go wnext))
            (else
             (reset! st m)
-            (Err (expected-found-error st (quoted s))))))))))
+            (Err (error-at st items)))))))))
 
 (: pstring/ci (-> string (Parser string)))
 (defun (pstring/ci s)
+  (def items (expected-items (quoted s)))
   (fun (st)
     (def m (mark st))
     (def text (record-ref st text))
@@ -577,7 +594,7 @@
          (Ok (substring/cursors text start (record-ref st pos))))
         ((at-end? st)
          (reset! st m)
-         (Err (expected-found-error st (quoted s))))
+         (Err (error-at st items)))
         (else
          (def (Tuple want wnext) (string-cursor-ref+next s sc))
          (def (Tuple got gnext) (string-cursor-ref+next text (record-ref st pos)))
@@ -585,7 +602,7 @@
            ((char-ci=? want got) (advance! st got gnext) (go wnext))
            (else
             (reset! st m)
-            (Err (expected-found-error st (quoted s))))))))))
+            (Err (error-at st items)))))))))
 
 ;; The run of characters satisfying pred, as a string. Never fails.
 (: many-satisfy (-> (-> char bool) (Parser string)))
@@ -597,10 +614,11 @@
 
 (: many-satisfy1 (-> (-> char bool) string (Parser string)))
 (defun (many-satisfy1 pred what)
+  (def items (expected-items what))
   (fun (st)
     (def start (record-ref st pos))
     (cond
-      ((= 0 (skip-while! st pred)) (Err (expected-found-error st what)))
+      ((= 0 (skip-while! st pred)) (Err (error-at st items)))
       (else (Ok (substring/cursors (record-ref st text) start (record-ref st pos)))))))
 
 (: many-chars (-> (Parser char) (Parser string)))
@@ -655,19 +673,25 @@
                   (go))
                 (Ok unit)))))))
 
+(: spaces1-items (List ErrorItem))
+(def spaces1-items (expected-items "whitespace"))
+
 (: spaces1 (Parser void))
 (defun (spaces1 st)
   (cond
     ((> (skip-while! st char-whitespace?) 0) (Ok unit))
-    (else (Err (expected-found-error st "whitespace")))))
+    (else (Err (error-at st spaces1-items)))))
 
 ;; A line ending in any of its three spellings, answering #\newline.
+(: pnewline-items (List ErrorItem))
+(def pnewline-items (expected-items "a newline"))
+
 (: pnewline (Parser char))
 (defun (pnewline st)
   (cond
     ((skip-char! st #\return) (ignore (skip-char! st #\newline)) (Ok #\newline))
     ((skip-char! st #\newline) (Ok #\newline))
-    (else (Err (expected-found-error st "a newline")))))
+    (else (Err (error-at st pnewline-items)))))
 
 (: ascii-digit? (-> char bool))
 (defun (ascii-digit? c)
@@ -683,11 +707,14 @@
 (def alphanumeric
   (satisfy (fun (c) (or (char-alphabetic? c) (ascii-digit? c))) "a letter or a digit"))
 
+(: eof-items (List ErrorItem))
+(def eof-items (expected-items "end of input"))
+
 (: eof (Parser void))
 (defun (eof st)
   (cond
     ((at-end? st) (Ok unit))
-    (else (Err (expected-found-error st "end of input")))))
+    (else (Err (error-at st eof-items)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Repetition
@@ -840,6 +867,9 @@
               (let () (advance! st c next) (go (+ n 1)))
               n)))))
 
+(: pint-items (List ErrorItem))
+(def pint-items (expected-items "an integer"))
+
 (: pint (Parser int))
 (defun (pint st)
   (def text (record-ref st text))
@@ -849,8 +879,11 @@
   (cond
     ((= 0 (skip-digits! st))
      (reset! st m)
-     (Err (expected-found-error st "an integer")))
+     (Err (error-at st pint-items)))
     (else (Ok (string->int (substring/cursors text start (record-ref st pos)))))))
+
+(: pdouble-items (List ErrorItem))
+(def pdouble-items (expected-items "a number"))
 
 (: pdouble (Parser double))
 (defun (pdouble st)
@@ -861,7 +894,7 @@
   (cond
     ((= 0 (skip-digits! st))
      (reset! st m)
-     (Err (expected-found-error st "a number")))
+     (Err (error-at st pdouble-items)))
     (else
      (skip-fraction! st)
      (skip-exponent! st)
