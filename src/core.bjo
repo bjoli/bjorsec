@@ -20,7 +20,7 @@
 
 (export
   ;; types
-  State Mark Position ErrorItem ParseError Parser ParserRef
+  State Mark Position ErrorItem ErrorItems ParseError Parser ParserRef
   ;; running a parser
   make-state state-position run-parser run-parser/message error->string parse-error-position
   ;; primitives
@@ -149,6 +149,19 @@
                  (Unexpected string)
                  (ErrorMessage string))))
 
+;; Expectations combine as a tree rather than by copying lists. A merge at one
+;; position is a node, and the list is read back in order only when an error is
+;; printed, so merging costs no allocation.
+(type
+  (: ErrorItems #:opaque (Union
+                  ItemsNone
+                  (ItemsLeaf (List ErrorItem))
+                  (ItemsBoth ErrorItems ErrorItems))))
+
+;; Nothing expected. What a failed choice starts from, and what an expectation
+;; from elsewhere merges cleanly with.
+(def no-items ItemsNone)
+
 ;; The source is carried so that an error can print the line it happened on
 ;; without the caller having to hand the text back.
 (type
@@ -157,9 +170,9 @@
                   (: err-pos StringCursor)
                   (: err-line int)
                   (: err-line-start StringCursor)
-                  (: items (List ErrorItem)))))
+                  (: items ErrorItems))))
 
-(: error-at (-> State (List ErrorItem) ParseError))
+(: error-at (-> State ErrorItems ParseError))
 (defun (error-at st xs)
   (ParseError (source (record-ref st text))
               (err-pos (record-ref st pos))
@@ -167,15 +180,33 @@
               (err-line-start (record-ref st line-start))
               (items xs)))
 
-;; The item list for a fixed expectation, built once when a parser is made
+;; The item tree for a fixed expectation, built once when a parser is made
 ;; rather than on every failure. A failing parser then allocates nothing.
-(: expected-items (-> string (List ErrorItem)))
+(: expected-items (-> string ErrorItems))
 (defun (expected-items what)
-  (Cons (Expected what) Nil))
+  (ItemsLeaf (Cons (Expected what) Nil)))
 
-(: message-items (-> string (List ErrorItem)))
+(: message-items (-> string ErrorItems))
 (defun (message-items msg)
-  (Cons (ErrorMessage msg) Nil))
+  (ItemsLeaf (Cons (ErrorMessage msg) Nil)))
+
+;; Left to right, which is the order the expectations were reported in.
+(: items-flatten (-> ErrorItems (List ErrorItem)))
+(defun (items-flatten xs)
+  (match xs
+    (ItemsNone Nil)
+    ((ItemsLeaf l) l)
+    ((ItemsBoth a b) (list-append (items-flatten a) (items-flatten b)))))
+
+;; A side that is empty is dropped, so a choice that failed with nothing to say
+;; does not stand in the way of one that did.
+(: items-merge (-> ErrorItems ErrorItems ErrorItems))
+(defun (items-merge a b)
+  (match a
+    (ItemsNone b)
+    (_ (match b
+         (ItemsNone a)
+         (_ (ItemsBoth a b))))))
 
 ;; The character at a cursor, as a message names it. Used when printing an
 ;; error, not while parsing: the error carries the position, so nothing on the
@@ -218,7 +249,7 @@
                       (err-pos pa)
                       (err-line (record-ref a err-line))
                       (err-line-start (record-ref a err-line-start))
-                      (items (list-append (record-ref a items) (record-ref b items)))))))
+                      (items (items-merge (record-ref a items) (record-ref b items)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Reporting
@@ -298,21 +329,22 @@
     ((Some text)
      (stringbuilder-add-string! sb (str "\n" text "\n" (string-pad-left "^" column))))
     (None unit))
-  (def expected (expected-strings (record-ref e items)))
+  (def items (items-flatten (record-ref e items)))
+  (def expected (expected-strings items))
   ;; The character at the error position is shown when the error also has
   ;; expectations: a parser that only knows what it wanted still says what it
   ;; found. An error carrying no expectation is printed as it was written.
   (def unexpected
     (if (list-empty? expected)
-        (unexpected-strings (record-ref e items))
-        (unique (list-append (unexpected-strings (record-ref e items))
+        (unexpected-strings items)
+        (unique (list-append (unexpected-strings items)
                              (Cons (found (record-ref e source) (record-ref e err-pos)) Nil)))))
   (unless (list-empty? expected)
     (stringbuilder-add-string! sb (str "\nExpecting: " (or-join expected))))
   (unless (list-empty? unexpected)
     (stringbuilder-add-string! sb (str "\nUnexpected: " (or-join unexpected))))
   (list-for-each (fun (m) (stringbuilder-add-string! sb (str "\n" m)))
-                 (message-strings (record-ref e items)))
+                 (message-strings items))
   (stringbuilder->string sb))
 
 (impl (->str ParseError)
@@ -348,7 +380,7 @@
 ;; expectation from elsewhere merges cleanly with.
 (: pzero (Parser %a))
 (defun (pzero st)
-  (Err (error-at st Nil)))
+  (Err (error-at st no-items)))
 
 (: pfail (-> string (Parser %a)))
 (defun (pfail msg)
@@ -432,7 +464,20 @@
 
 (: choice (-> (List (Parser %a)) (Parser %a)))
 (defun (choice ps)
-  (list-foldr por pzero ps))
+  (fun (st)
+    (def m (mark st))
+    (let go ((rest ps) (acc (error-at st no-items)))
+      (match rest
+        (Nil (Err acc))
+        ((Cons p more)
+         (match (p st)
+           ((Ok v) (Ok v))
+           ((Err e)
+            (cond
+              ;; An alternative that consumed input ended the choice: its error
+              ;; is the one to report, with whatever earlier ones said.
+              ((moved? st m) (Err (error-merge acc e)))
+              (else (go more (error-merge acc e)))))))))))
 
 ;; Turns a failure that consumed input into one that did not, which is what
 ;; lets por try the next alternative after it.
@@ -465,7 +510,7 @@
 
 (: not-followed-by (-> (Parser %a) string (Parser void)))
 (defun (not-followed-by p what)
-  (def items (Cons (Unexpected what) Nil))
+  (def items (ItemsLeaf (Cons (Unexpected what) Nil)))
   (fun (st)
     (def m (mark st))
     (def reply (p st))
@@ -508,7 +553,7 @@
          ((pred c) (advance! st c next) (Ok c))
          (else (Err (error-at st items))))))))
 
-(: any-char-items (List ErrorItem))
+(: any-char-items ErrorItems)
 (def any-char-items (expected-items "any character"))
 
 (: any-char (Parser char))
@@ -673,7 +718,7 @@
                   (go))
                 (Ok unit)))))))
 
-(: spaces1-items (List ErrorItem))
+(: spaces1-items ErrorItems)
 (def spaces1-items (expected-items "whitespace"))
 
 (: spaces1 (Parser void))
@@ -683,7 +728,7 @@
     (else (Err (error-at st spaces1-items)))))
 
 ;; A line ending in any of its three spellings, answering #\newline.
-(: pnewline-items (List ErrorItem))
+(: pnewline-items ErrorItems)
 (def pnewline-items (expected-items "a newline"))
 
 (: pnewline (Parser char))
@@ -707,7 +752,7 @@
 (def alphanumeric
   (satisfy (fun (c) (or (char-alphabetic? c) (ascii-digit? c))) "a letter or a digit"))
 
-(: eof-items (List ErrorItem))
+(: eof-items ErrorItems)
 (def eof-items (expected-items "end of input"))
 
 (: eof (Parser void))
@@ -867,7 +912,7 @@
               (let () (advance! st c next) (go (+ n 1)))
               n)))))
 
-(: pint-items (List ErrorItem))
+(: pint-items ErrorItems)
 (def pint-items (expected-items "an integer"))
 
 (: pint (Parser int))
@@ -882,7 +927,7 @@
      (Err (error-at st pint-items)))
     (else (Ok (string->int (substring/cursors text start (record-ref st pos)))))))
 
-(: pdouble-items (List ErrorItem))
+(: pdouble-items ErrorItems)
 (def pdouble-items (expected-items "a number"))
 
 (: pdouble (Parser double))

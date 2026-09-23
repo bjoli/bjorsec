@@ -98,6 +98,11 @@
   (show "attempt backtracks in por"
         (okv (por (attempt (pright (pchar #\a) (pchar #\b))) (pchar #\a)) "ac"))
 
+  (show "choice stops after a moving failure"
+        (err (choice (list (pright (pchar #\a) (pchar #\b)) (pchar #\a))) "ax"))
+  (show "choice merges earlier then stops"
+        (err (choice (list (pchar #\q) (pright (pchar #\a) (pchar #\b)) (pchar #\a))) "ax"))
+
   (show "ok: calc 1 + 2 * 3" (okv calculator "1 + 2 * 3"))
   (show "ok: calc -2 * 3" (okv calculator "-2 * 3"))
   (show "ok: por hello" (okv (por (pstring "hello") (pstring "world")) "hello"))
