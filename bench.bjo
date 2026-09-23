@@ -55,14 +55,20 @@
       (loop (+ i 1))))
 
   (println (str "Parsing " (int->string n) " elements 20 times..."))
-  (def sw (stopwatch))
-  (stopwatch-start! sw)
-  (let loop ((i 0) (acc 0.0))
+  (def t-start (now))
+  (let loop ((i 0) (acc 0.0) (bytes 0L))
     (if (< i 20)
-        (match (run-parser calculator input)
-          ((Ok v) (loop (+ i 1) (+ acc v)))
-          ((Err e) (println (error->string e)) (loop (+ i 1) acc)))
         (let ()
-          (stopwatch-stop! sw)
-          (println (str "Bjolang inner loop: " (->str (stopwatch-ms sw)) " ms (sum: " (double->string acc) ")")))))
+          (def t0 (now))
+          (def before (get-memory-usage))
+          (def r (run-parser calculator input))
+          (def used (- (get-memory-usage) before))
+          (def t1 (now))
+          (println (str "run " (->str i) ": " (->str (- t1 t0)) " ms, " (->str used) " B"))
+          (match r
+            ((Ok v) (loop (+ i 1) (+ acc v) (+ bytes used)))
+            ((Err e) (println (error->string e)) (loop (+ i 1) acc (+ bytes used)))))
+        (println (str "Bjolang inner loop: " (->str (- (now) t-start)) " ms total, "
+                      (->str bytes) " bytes (" (->str (/ bytes 20)) " per parse) (sum: "
+                      (double->string acc) ")"))))
   0)

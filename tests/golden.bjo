@@ -1,0 +1,106 @@
+;; tests/golden.bjo
+;;
+;; Exact error->string output for a spread of failing parsers, plus a few
+;; success values. The output is captured to a file and diffed against a
+;; recorded baseline, so a change in any error message shows up as a diff.
+
+(import (bjorsec core))
+
+;; ---------------------------------------------------------------------------
+;; The calculator grammar, as in bench.bjo
+;; ---------------------------------------------------------------------------
+
+(: token (-> (Parser %a) (Parser %a)))
+(defun (token p) (pleft p spaces))
+
+(: sym (-> char (Parser char)))
+(defun (sym c) (token (pchar c)))
+
+(: number (Parser double))
+(def number (token (plabel pdouble "a number")))
+
+(: expr-ref (ParserRef double))
+(def expr-ref (pforward))
+
+(: expr (Parser double))
+(def expr (pforwarded expr-ref))
+
+(: factor (Parser double))
+(def factor (por number (between (sym #\() (sym #\)) expr)))
+
+(: mul-op (Parser (-> double double double)))
+(def mul-op
+  (por (pright (sym #\*) (preturn (fun (a b) (* a b))))
+       (pright (sym #\/) (preturn (fun (a b) (/ a b))))))
+
+(: add-op (Parser (-> double double double)))
+(def add-op
+  (por (pright (sym #\+) (preturn (fun (a b) (+ a b))))
+       (pright (sym #\-) (preturn (fun (a b) (- a b))))))
+
+(: term (Parser double))
+(def term (chainl1 factor mul-op))
+
+(: sum (Parser double))
+(def sum (chainl1 term add-op))
+
+(: calculator (Parser double))
+(def calculator (pright spaces (pleft sum eof)))
+
+;; ---------------------------------------------------------------------------
+;; Helpers
+;; ---------------------------------------------------------------------------
+
+(: err (-> (Parser %a) string string))
+(defun (err p text)
+  (match (run-parser/message p text)
+    ((Ok v) "OK (no error)")
+    ((Err e) e)))
+
+(: okv (-> (Parser %a) string string) (where (->str %a)))
+(defun (okv p text)
+  (match (run-parser p text)
+    ((Ok v) (str "OK " (->str v)))
+    ((Err e) (str "ERR " (error->string e)))))
+
+(: show (-> string string void))
+(defun (show label out)
+  (println (str "===== " label))
+  (println out)
+  (println "===== end"))
+
+(defun (main args)
+  (pforward-set! expr-ref sum)
+
+  (show "calc: 1 +" (err calculator "1 +"))
+  (show "calc: 1 + * 2" (err calculator "1 + * 2"))
+  (show "calc: (1 + 2" (err calculator "(1 + 2"))
+  (show "calc: empty" (err calculator ""))
+  (show "calc: line 3" (err calculator "1 +\n2 +\n* 3"))
+
+  (show "por strings on help" (err (por (pstring "hello") (pstring "world")) "help"))
+  (show "choice pchar on z" (err (choice (list (pchar #\a) (pchar #\b) (pchar #\c))) "z"))
+  (show "choice pchar on eof" (err (choice (list (pchar #\a) (pchar #\b) (pchar #\c))) ""))
+
+  (show "plabel" (err (plabel (pchar #\a) "a greeting") "z"))
+  (show "pfail" (err (pfail "nope") "x"))
+  (show "followed-by" (err (pleft (pchar #\a) (followed-by (pchar #\b) "'b'")) "ac"))
+  (show "not-followed-by" (err (not-followed-by (pchar #\b) "'b'") "a"))
+  (show "many-till" (err (many-till any-char (pchar #\!)) "abc"))
+  (show "eof" (err eof "ab"))
+  (show "pint" (err pint "x"))
+  (show "pdouble" (err pdouble "x"))
+
+  (show "unexpected emoji" (err (pchar #\a) "😀"))
+  (show "unexpected tab" (err (pchar #\a) "\t"))
+  (show "unexpected newline" (err (pchar #\a) "\n"))
+
+  (show "attempt backtracks in por"
+        (okv (por (attempt (pright (pchar #\a) (pchar #\b))) (pchar #\a)) "ac"))
+
+  (show "ok: calc 1 + 2 * 3" (okv calculator "1 + 2 * 3"))
+  (show "ok: calc -2 * 3" (okv calculator "-2 * 3"))
+  (show "ok: por hello" (okv (por (pstring "hello") (pstring "world")) "hello"))
+  (show "ok: pint -42" (okv pint "-42"))
+  (show "ok: pdouble 3.5e2" (okv pdouble "3.5e2"))
+  0)
