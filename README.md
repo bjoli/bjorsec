@@ -61,4 +61,4 @@ bjo run tests/golden.bjo   # exact error messages, to diff against a recorded ru
 
 ## License
 
-MPL-2.0.
+MPL-2.0; see [LICENSE](LICENSE).
