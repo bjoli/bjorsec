@@ -135,9 +135,9 @@
 (: state-position (-> State Position))
 (defun (state-position st)
   (Position (line (record-ref st line))
-            (column (+ 1 (string-count (substring/cursors (record-ref st text)
-                                                          (record-ref st line-start)
-                                                          (record-ref st pos)))))))
+            (column (+ 1 (string-count (substring (record-ref st text)
+                                                  (record-ref st line-start)
+                                                  (record-ref st pos)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Errors
@@ -310,14 +310,14 @@
   (def lines (string-split text "\n"))
   (cond
     ((or (< n 1) (> n (vec-length lines))) None)
-    (else (Some (string-trim-end (vec-ref lines (- n 1)))))))
+    (else (Some (string-trim-right (vec-ref lines (- n 1)))))))
 
 (: parse-error-position (-> ParseError Position))
 (defun (parse-error-position e)
   (Position (line (record-ref e err-line))
-            (column (+ 1 (string-count (substring/cursors (record-ref e source)
-                                                          (record-ref e err-line-start)
-                                                          (record-ref e err-pos)))))))
+            (column (+ 1 (string-count (substring (record-ref e source)
+                                                  (record-ref e err-line-start)
+                                                  (record-ref e err-pos)))))))
 
 (: error->string (-> ParseError string))
 (defun (error->string e)
@@ -694,7 +694,7 @@
     (let go ((sc (string-cursor-start s)))
       (cond
         ((string-cursor-end? s sc)
-         (Ok (substring/cursors text start (record-ref st pos))))
+         (Ok (substring text start (record-ref st pos))))
         ((at-end? st)
          (reset! st m)
          (Err (failure-at st items)))
@@ -713,7 +713,7 @@
   (fun (st)
     (def start (record-ref st pos))
     (ignore (skip-while! st pred))
-    (Ok (substring/cursors (record-ref st text) start (record-ref st pos)))))
+    (Ok (substring (record-ref st text) start (record-ref st pos)))))
 
 (: many-satisfy1 (-> (-> char bool) string (Parser string)))
 (defun (many-satisfy1 pred what)
@@ -722,7 +722,7 @@
     (def start (record-ref st pos))
     (cond
       ((= 0 (skip-while! st pred)) (Err (failure-at st items)))
-      (else (Ok (substring/cursors (record-ref st text) start (record-ref st pos)))))))
+      (else (Ok (substring (record-ref st text) start (record-ref st pos)))))))
 
 (: many-chars (-> (Parser char) (Parser string)))
 (defun (many-chars p)
@@ -1015,7 +1015,7 @@
     ((= 0 (skip-digits! st))
      (reset! st m)
      (Err (failure-at st pint-items)))
-    (else (Ok (string->int (substring/cursors text start (record-ref st pos)))))))
+    (else (Ok (string->int (substring text start (record-ref st pos)))))))
 
 (: pdouble-items ErrorItems)
 (def pdouble-items (expected-items "a number"))
@@ -1033,7 +1033,7 @@
     (else
      (skip-fraction! st)
      (skip-exponent! st)
-     (Ok (string->double (substring/cursors text start (record-ref st pos)))))))
+     (Ok (string->double (substring text start (record-ref st pos)))))))
 
 ;; A dot with no digit after it belongs to whatever comes next, not to the
 ;; number, so it is given back.
