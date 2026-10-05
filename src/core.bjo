@@ -20,7 +20,7 @@
 
 (export
   ;; types
-  State Mark Position ErrorItem ErrorItems Failure ParseError Parser ParserRef
+  State Position ErrorItem ErrorItems Failure ParseError Parser ParserRef
   ;; running a parser
   make-state state-position run-parser run-parser/message error->string parse-error-position
   ;; primitives
@@ -39,6 +39,8 @@
   pint pdouble
   ;; recursive grammars
   pforward pforwarded pforward-set! plazy)
+
+(:doc #:file "core.bjodoc")
 
 ;; ---------------------------------------------------------------------------
 ;; The state
@@ -591,8 +593,9 @@
          (else (Err (failure-at st items))))))))
 
 (: pposition (Parser Position))
-(defun (pposition st)
-  (Ok (state-position st)))
+(def pposition
+  (fun (st)
+    (Ok (state-position st))))
 
 ;; ---------------------------------------------------------------------------
 ;; Characters and strings
@@ -614,13 +617,14 @@
 (def any-char-items (expected-items "any character"))
 
 (: any-char (Parser char))
-(defun (any-char st)
-  (cond
-    ((at-end? st) (Err (failure-at st any-char-items)))
-    (else
-     (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
-     (advance! st c next)
-     (Ok c))))
+(def any-char
+  (fun (st)
+    (cond
+      ((at-end? st) (Err (failure-at st any-char-items)))
+      (else
+       (def (Tuple c next) (string-cursor-ref+next (record-ref st text) (record-ref st pos)))
+       (advance! st c next)
+       (Ok c)))))
 
 (: pchar (-> char (Parser char)))
 (defun (pchar c)
@@ -804,21 +808,23 @@
 (def spaces1-items (expected-items "whitespace"))
 
 (: spaces1 (Parser void))
-(defun (spaces1 st)
-  (cond
-    ((> (skip-while! st char-whitespace?) 0) (Ok unit))
-    (else (Err (failure-at st spaces1-items)))))
+(def spaces1
+  (fun (st)
+    (cond
+      ((> (skip-while! st char-whitespace?) 0) (Ok unit))
+      (else (Err (failure-at st spaces1-items))))))
 
 ;; A line ending in any of its three spellings, answering #\newline.
 (: pnewline-items ErrorItems)
 (def pnewline-items (expected-items "a newline"))
 
 (: pnewline (Parser char))
-(defun (pnewline st)
-  (cond
-    ((skip-char! st #\return) (ignore (skip-char! st #\newline)) (Ok #\newline))
-    ((skip-char! st #\newline) (Ok #\newline))
-    (else (Err (failure-at st pnewline-items)))))
+(def pnewline
+  (fun (st)
+    (cond
+      ((skip-char! st #\return) (ignore (skip-char! st #\newline)) (Ok #\newline))
+      ((skip-char! st #\newline) (Ok #\newline))
+      (else (Err (failure-at st pnewline-items))))))
 
 (: ascii-digit? (-> char bool))
 (defun (ascii-digit? c)
@@ -838,10 +844,11 @@
 (def eof-items (expected-items "end of input"))
 
 (: eof (Parser void))
-(defun (eof st)
-  (cond
-    ((at-end? st) (Ok unit))
-    (else (Err (failure-at st eof-items)))))
+(def eof
+  (fun (st)
+    (cond
+      ((at-end? st) (Ok unit))
+      (else (Err (failure-at st eof-items))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Repetition
@@ -1030,34 +1037,36 @@
 (def pint-items (expected-items "an integer"))
 
 (: pint (Parser int))
-(defun (pint st)
-  (def text (record-ref st text))
-  (def m (mark st))
-  (def start (record-ref st pos))
-  (ignore (skip-sign! st))
-  (cond
-    ((= 0 (skip-digits! st))
-     (reset! st m)
-     (Err (failure-at st pint-items)))
-    (else (Ok (string->int (substring/slice text start (record-ref st pos)))))))
+(def pint
+  (fun (st)
+    (def text (record-ref st text))
+    (def m (mark st))
+    (def start (record-ref st pos))
+    (ignore (skip-sign! st))
+    (cond
+      ((= 0 (skip-digits! st))
+       (reset! st m)
+       (Err (failure-at st pint-items)))
+      (else (Ok (string->int (substring/slice text start (record-ref st pos))))))))
 
 (: pdouble-items ErrorItems)
 (def pdouble-items (expected-items "a number"))
 
 (: pdouble (Parser double))
-(defun (pdouble st)
-  (def text (record-ref st text))
-  (def m (mark st))
-  (def start (record-ref st pos))
-  (ignore (skip-sign! st))
-  (cond
-    ((= 0 (skip-digits! st))
-     (reset! st m)
-     (Err (failure-at st pdouble-items)))
-    (else
-     (skip-fraction! st)
-     (skip-exponent! st)
-     (Ok (string->double (substring/slice text start (record-ref st pos)))))))
+(def pdouble
+  (fun (st)
+    (def text (record-ref st text))
+    (def m (mark st))
+    (def start (record-ref st pos))
+    (ignore (skip-sign! st))
+    (cond
+      ((= 0 (skip-digits! st))
+       (reset! st m)
+       (Err (failure-at st pdouble-items)))
+      (else
+       (skip-fraction! st)
+       (skip-exponent! st)
+       (Ok (string->double (substring/slice text start (record-ref st pos))))))))
 
 ;; A dot with no digit after it belongs to whatever comes next, not to the
 ;; number, so it is given back.

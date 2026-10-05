@@ -1,0 +1,8 @@
+(meta (title "bjorsec: the reference")
+      (listing? #f))
+
+@generate-docs[#:path "../src/core.bjo"]{
+  The @link["index.html"]{guide} walks through the library in order:
+  reading text, combining parsers, alternatives and backing up, errors,
+  recursive grammars, and a whole calculator.
+}

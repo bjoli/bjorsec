@@ -1,0 +1,239 @@
+(meta (title "bjorsec")
+      (listing? #f))
+
+bjorsec is a library of parser combinators for Bjolang, after F#'s FParsec.
+A parser is built out of small parsers, each of which reads one thing, and
+an error says where the input went wrong and what would have been accepted
+there. The @link["reference.html"]{reference} has every function, with an
+example.
+
+@toc[#:depth 1]
+
+@section{Getting it}
+
+Add it to your project's @code{manifest.bjodat}:
+
+@codeblock[#:lang "bjolang"]|{
+(depends
+  (package (name (bjorsec))
+           (version (version-at-least "0.3.0"))
+           (source (git (url "https://github.com/bjoli/bjorsec")))))
+}|
+
+and import it:
+
+@codeblock[#:lang "bjolang"]|{
+(import (bjorsec core))
+}|
+
+@section{A first parser}
+
+A @code{(Parser %a)} reads from the front of some text and answers an
+@code{%a}. @code{run-parser} runs one:
+
+@codeblock[#:lang "bjolang"]|{
+(run-parser pint "42")         ; (Ok 42)
+(run-parser (pchar #\a) "abc") ; (Ok #\a)
+(run-parser pint "x")          ; (Err ...)
+}|
+
+A parser reads as far as it needs to and no further: @code{(run-parser pint
+"42abc")} is @code{(Ok 42)}. To insist on the whole input, end with
+@code{eof}:
+
+@codeblock[#:lang "bjolang"]|{
+(run-parser (pleft pint eof) "42abc")
+;; Parse error at line 1, column 3:
+;; 42abc
+;;   ^
+;; Expecting: end of input
+;; Unexpected: 'a'
+}|
+
+@section{Reading text}
+
+The small parsers read a character, a literal, a run or a number:
+
+@codeblock[#:lang "bjolang"]|{
+(pchar #\=)                               ; one particular character
+(pstring "let")                           ; a literal
+(any-of "+-*/")                           ; one of these characters
+(satisfy char-upper-case? "a capital")    ; any character a test accepts
+(many-satisfy1 char-alphabetic? "a word") ; a run of them, as a string
+pint pdouble                              ; numbers
+spaces                                    ; space, tabs and line breaks
+}|
+
+@section{Putting parsers together}
+
+Two parsers in a row are combined by what you want from them:
+
+@codeblock[#:lang "bjolang"]|{
+(pright (pchar #\$) pint)                ; "$42" -> 42: keep the right
+(pleft pint (pchar #\%))                 ; "42%" -> 42: keep the left
+(between (pchar #\() (pchar #\)) pint)   ; "(42)" -> 42
+(pboth letter digit)                     ; "a1" -> (Tuple #\a #\1)
+(ppipe2 pint (pright (pchar #\x) pint) *) ; "6x7" -> 42
+(pmap string-length (many-satisfy char-alphabetic?))   ; "hello" -> 5
+}|
+
+A token is usually a parser followed by the space after it. Writing that
+once keeps the grammar readable:
+
+@codeblock[#:lang "bjolang"]|{
+(: token (-> (Parser %a) (Parser %a)))
+(defun (token p) (pleft p spaces))
+}|
+
+@section{Repeating}
+
+@codeblock[#:lang "bjolang"]|{
+(many (token pint))                        ; "1 2 3" -> '(1 2 3)
+(sep-by pint (token (pchar #\,)))          ; "1, 2, 3" -> '(1 2 3)
+(many-fold + 0 (token pint))               ; "1 2 3" -> 6, nothing collected
+(many-till any-char (pstring "*/"))        ; the body of a comment
+}|
+
+Operators are @code{chainl1}: an operand, then any number of operator and
+operand, folded from the left. The operator parser answers the function
+that combines two operands:
+
+@codeblock[#:lang "bjolang"]|{
+(def minus (pright (pchar #\-) (preturn -)))
+(run-parser (chainl1 pint minus) "10-3-2")   ; (Ok 5), as (10-3)-2
+}|
+
+@section{Alternatives, and backing up}
+
+@code{por} tries a second parser when the first fails, and a choice that
+fails says what all of them wanted:
+
+@codeblock[#:lang "bjolang"]|{
+(def answer (por (pstring "yes") (pstring "no")))
+(run-parser answer "maybe")
+;; Expecting: 'yes' or 'no'
+}|
+
+One rule makes the errors good, and it is the one thing to understand about
+bjorsec: @strong{@code{por} tries the second parser only if the first failed
+without reading anything}. Once a parser has read part of something, its
+error is the one worth reporting:
+
+@codeblock[#:lang "bjolang"]|{
+(def a-then-b (pright (pchar #\a) (pstring "b")))
+(run-parser (por a-then-b (pstring "ac")) "ac")
+;; Expecting: 'b'. a-then-b read the a, so "ac" is never tried.
+}|
+
+When an alternative may read and then turn out wrong, wrap it in
+@code{attempt}, which moves back to where it began when it fails:
+
+@codeblock[#:lang "bjolang"]|{
+(run-parser (por (attempt a-then-b) (pstring "ac")) "ac")   ; (Ok "ac")
+}|
+
+@code{pstring}, @code{pint} and @code{pdouble} already move back by
+themselves, so a choice between literals needs no @code{attempt}:
+@code{(por (pstring "foo") (pstring "far"))} reads @code{"far"}. Keep
+@code{attempt} around the alternative that needs it and no wider: an error
+found inside it is reported where it began.
+
+@section{Errors worth reading}
+
+An error is a position and what was expected there. Name things in the words
+your reader uses:
+
+@codeblock[#:lang "bjolang"]|{
+(def name (plabel (many-satisfy1 char-alphabetic? "a letter") "a name"))
+(run-parser/message name "42")
+;; Parse error at line 1, column 1:
+;; 42
+;; ^
+;; Expecting: a name
+;; Unexpected: '4'
+}|
+
+and check what the grammar alone cannot with @code{pfail}:
+
+@codeblock[#:lang "bjolang"]|{
+(def byte
+  (pbind pint (fun (n) (if (< n 256) (preturn n) (pfail "a byte is at most 255")))))
+}|
+
+@code{run-parser/message} gives the message as a string; @code{run-parser}
+gives a @code{ParseError}, which @code{println} shows the same way and
+@code{parse-error-position} places.
+
+@section{Grammars that refer to themselves}
+
+An expression contains expressions. A grammar of @code{def}s refers to a
+parser before it is defined with @code{pforward}:
+
+@codeblock[#:lang "bjolang"]|{
+(: expr-ref (ParserRef int))
+(def expr-ref (pforward))
+
+(def factor (por pint (between (pchar #\() (pchar #\)) (pforwarded expr-ref))))
+;; ... the rest of the grammar, then:
+(pforward-set! expr-ref factor)
+}|
+
+A grammar of functions uses @code{plazy} instead, so that building the
+parser does not recurse forever:
+
+@codeblock[#:lang "bjolang"]|{
+(defun (expr)
+  (por pint (plazy (fun () (between (pchar #\() (pchar #\)) (expr))))))
+}|
+
+@section{All of it: a calculator}
+
+@codeblock[#:lang "bjolang"]|{
+(import (bjorsec core))
+
+(: token (-> (Parser %a) (Parser %a)))
+(defun (token p) (pleft p spaces))
+
+(: op (-> char (-> double double double) (Parser (-> double double double))))
+(defun (op c f) (pright (token (pchar c)) (preturn f)))
+
+(: expr-ref (ParserRef double))
+(def expr-ref (pforward))
+
+(def factor (por (token pdouble)
+                 (between (token (pchar #\()) (token (pchar #\))) (pforwarded expr-ref))))
+(def term (chainl1 factor (por (op #\* *) (op #\/ /))))
+(def sum (chainl1 term (por (op #\+ +) (op #\- -))))
+(def calculator (pright spaces (pleft sum eof)))
+
+(defun (main)
+  (pforward-set! expr-ref sum)
+  (println (run-parser calculator "2 * (3 + 4)"))   ; (Ok 14)
+  (println (run-parser calculator "2 * (3 + 4"))
+  ;; Parse error at line 1, column 11:
+  ;; 2 * (3 + 4
+  ;;           ^
+  ;; Expecting: ')'
+  ;; Unexpected: end of input
+  0)
+}|
+
+Precedence is one @code{chainl1} per level: a sum is made of terms, and a
+term of factors, so @code{*} binds tighter than @code{+}.
+
+@section{Speed}
+
+@itemlist{
+  @item{@strong{Build a parser once.} Parsers are values. Define a grammar
+  with @code{def} and run it many times, rather than building it again for
+  every input.}
+  @item{@strong{Read runs, not characters.} @code{many-satisfy} reads a run
+  in one step; @code{many-chars} of a character parser builds the string a
+  character at a time. Use the second only when the characters need
+  parsing, such as escapes.}
+  @item{@strong{Slices for long runs.} @code{many-satisfy/slice} and
+  @code{many-satisfy1/slice} answer a slice of the input instead of a copy:
+  a file of 77-byte lines parses 38% faster with half the allocation. A
+  slice keeps the whole input alive while it is held, so use them for runs
+  that are looked at and dropped, and @code{string-copy} one to keep it.}
+}
