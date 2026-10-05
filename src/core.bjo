@@ -29,7 +29,7 @@
   por choice attempt look-ahead followed-by not-followed-by plabel pposition
   ;; characters and strings
   satisfy any-char pchar pchar/ci any-of none-of pstring pstring/ci
-  many-satisfy many-satisfy1 many-chars many-chars1
+  many-satisfy many-satisfy1 many-satisfy/slice many-satisfy1/slice many-chars many-chars1
   spaces spaces1 pnewline letter digit alphanumeric eof
   ;; repetition
   many many1 skip-many skip-many1 many-fold many-till prepeat
@@ -44,8 +44,8 @@
 ;; The state
 ;; ---------------------------------------------------------------------------
 ;; The cursor is where the parser is. The line and the start of it are carried
-;; along so that a position costs one substring of the current line rather than
-;; a walk of everything before it.
+;; along so that a position costs a walk of the current line rather than of
+;; everything before it.
 
 (type
   (: State (Record
@@ -135,9 +135,15 @@
 (: state-position (-> State Position))
 (defun (state-position st)
   (Position (line (record-ref st line))
-            (column (+ 1 (string-count (substring (record-ref st text)
-                                                  (record-ref st line-start)
-                                                  (record-ref st pos)))))))
+            (column (column-of (record-ref st text) (record-ref st line-start) (record-ref st pos)))))
+
+;; The column of `pos`, counting characters from the start of its line. Over a
+;; slice, so that `pposition`, which may ask for every token, copies nothing,
+;; and the count stays vectorized: on one very long line it is still a count of
+;; the line so far.
+(: column-of (-> string StringCursor StringCursor int))
+(defun (column-of text line-start pos)
+  (+ 1 (string-count (substring/slice text line-start pos))))
 
 ;; ---------------------------------------------------------------------------
 ;; Errors
@@ -315,9 +321,7 @@
 (: parse-error-position (-> ParseError Position))
 (defun (parse-error-position e)
   (Position (line (record-ref e err-line))
-            (column (+ 1 (string-count (substring (record-ref e source)
-                                                  (record-ref e err-line-start)
-                                                  (record-ref e err-pos)))))))
+            (column (column-of (record-ref e source) (record-ref e err-line-start) (record-ref e err-pos)))))
 
 (: error->string (-> ParseError string))
 (defun (error->string e)
@@ -724,6 +728,26 @@
       ((= 0 (skip-while! st pred)) (Err (failure-at st items)))
       (else (Ok (substring (record-ref st text) start (record-ref st pos)))))))
 
+;; The same runs as slices of the input: no copy, which pays for a run of more
+;; than a few bytes, but a slice keeps the whole input alive for as long as it
+;; is held. For a run that is looked at and let go — a line, a comment, a field
+;; parsed further — rather than one kept in the tree. `string-copy` keeps one.
+(: many-satisfy/slice (-> (-> char bool) (Parser string)))
+(defun (many-satisfy/slice pred)
+  (fun (st)
+    (def start (record-ref st pos))
+    (ignore (skip-while! st pred))
+    (Ok (substring/slice (record-ref st text) start (record-ref st pos)))))
+
+(: many-satisfy1/slice (-> (-> char bool) string (Parser string)))
+(defun (many-satisfy1/slice pred what)
+  (def items (expected-items what))
+  (fun (st)
+    (def start (record-ref st pos))
+    (cond
+      ((= 0 (skip-while! st pred)) (Err (failure-at st items)))
+      (else (Ok (substring/slice (record-ref st text) start (record-ref st pos)))))))
+
 (: many-chars (-> (Parser char) (Parser string)))
 (defun (many-chars p)
   (fun (st)
@@ -1015,7 +1039,7 @@
     ((= 0 (skip-digits! st))
      (reset! st m)
      (Err (failure-at st pint-items)))
-    (else (Ok (string->int (substring text start (record-ref st pos)))))))
+    (else (Ok (string->int (substring/slice text start (record-ref st pos)))))))
 
 (: pdouble-items ErrorItems)
 (def pdouble-items (expected-items "a number"))
@@ -1033,7 +1057,7 @@
     (else
      (skip-fraction! st)
      (skip-exponent! st)
-     (Ok (string->double (substring text start (record-ref st pos)))))))
+     (Ok (string->double (substring/slice text start (record-ref st pos)))))))
 
 ;; A dot with no digit after it belongs to whatever comes next, not to the
 ;; number, so it is given back.

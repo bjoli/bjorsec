@@ -97,6 +97,8 @@
   (def broken (pright (pstring "ab\nc") (pchar #\z)))
   (expect-true "an error names its line" (string-contains? (message broken text) "line 2"))
   (expect-true "an error names its column" (string-contains? (message broken text) "column 2"))
+  (expect-true "a column counts characters, not bytes"
+               (string-contains? (message (pright (pstring "åäö") (pchar #\z)) "åäöx") "column 4"))
   (expect-true "an error draws the line it is on" (string-contains? (message broken text) "\ncd\n"))
   (expect-true "an error points at the character" (string-contains? (message broken text) "^"))
   (expect-true "an error says what was there instead"
@@ -135,6 +137,10 @@
   (expect "many-satisfy of nothing" (value (many-satisfy char-alphabetic?) "1" "x") "")
   (expect "many-satisfy1" (value (many-satisfy1 char-alphabetic? "a word") "abc1" "") "abc")
   (expect-true "many-satisfy1 needs one" (not (ok? (many-satisfy1 char-alphabetic? "a word") "1")))
+  (expect "many-satisfy/slice" (value (many-satisfy/slice char-alphabetic?) "abc1" "") "abc")
+  (expect "many-satisfy/slice of nothing" (value (many-satisfy/slice char-alphabetic?) "1" "x") "")
+  (expect "many-satisfy1/slice" (value (many-satisfy1/slice char-alphabetic? "a word") "åäö!" "") "åäö")
+  (expect-true "many-satisfy1/slice needs one" (not (ok? (many-satisfy1/slice char-alphabetic? "a word") "1")))
   (expect "many-chars" (value (many-chars letter) "abc1" "") "abc")
   (expect "many-chars1" (value (many-chars1 alphanumeric) "a1!" "") "a1")
   (expect "spaces" (value (pright spaces (pchar #\a)) "   a" #\z) #\a)
