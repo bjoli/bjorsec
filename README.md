@@ -51,7 +51,7 @@ bjo run examples/markdown.bjo /path/to/bjorsec/docs/reference.sz
 ## Tests
 
 ```sh
-bjo run tests/demo.bjo     # the combinators, one by one
+bjo test tests/demo.bjo    # the combinators, one by one; silent unless one fails
 bjo run tests/docs.bjo     # every example in the guide and the reference
 bjo run tests/golden.bjo   # exact error messages, to diff against a recorded run
 ```
